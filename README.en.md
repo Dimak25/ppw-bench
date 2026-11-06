@@ -83,7 +83,11 @@ py ppw_bench.py --duration 120  :: more stable (PL1)
 py ppw_bench.py --list          :: list power sensors and exit
 ```
 
-Or double-click `run.bat`.
+Or double-click `run.bat` / `ppw-bench.exe`.
+
+With no arguments an interactive menu opens: show power sensors, quick test
+(20 s), normal (60 s) or long (120 s). After the test the app asks whether to
+save the `.txt` report and keeps the window open.
 
 | Option | Description |
 |--------|-------------|
@@ -95,6 +99,7 @@ Or double-click `run.bat`.
 | `--watts N` | use a fixed CPU wattage (no sensors available) |
 | `--out FILE` | report path (default `ppw-report-*.txt`) |
 | `--list` | list detected sensors and exit |
+| `--interactive` | open the interactive menu |
 | `--version` | print the version and exit |
 
 ## Sample output

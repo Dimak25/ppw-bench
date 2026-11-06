@@ -20,8 +20,9 @@ ppw_bench.py - измерение Performance-per-Watt (PPW) для CPU.
     py ppw_bench.py --watts 45           # если датчиков нет: задать мощность вручную
     py ppw_bench.py --list               # показать найденные датчики и выйти
 
-Portable-сборка (см. Releases) запускается так же:
-    ppw-bench.exe --quick
+Без аргументов (двойной щелчок по ppw-bench.exe) открывается интерактивное
+меню: датчики, быстрый/обычный/длительный тест. После теста можно выбрать,
+сохранять ли отчёт в файл.
 """
 
 from __future__ import annotations
@@ -42,7 +43,7 @@ from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 HERE = Path(__file__).resolve().parent
 FROZEN = bool(getattr(sys, "frozen", False))
@@ -68,11 +69,52 @@ def setup_console() -> None:
         k32.SetConsoleCP(65001)
     except Exception:
         pass
-    for stream in (sys.stdout, sys.stderr):
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+
+
+def is_interactive() -> bool:
+    """Меню показываем только при запуске без аргументов из настоящей консоли."""
+    try:
+        return len(sys.argv) == 1 and sys.stdin is not None and sys.stdin.isatty()
+    except Exception:
+        return False
+
+
+def ask_choice(prompt: str, choices: set[str], default: str) -> str:
+    while True:
+        try:
+            raw = input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return default
+        if not raw:
+            return default
+        if raw in choices:
+            return raw
+        print(f"Нет такого варианта: {raw}")
+
+
+def ask_yes_no(prompt: str, default: bool = True) -> bool:
+    hint = "[Y/n]" if default else "[y/N]"
+    try:
+        raw = input(f"{prompt} {hint}: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return default
+    if not raw:
+        return default
+    return raw in ("y", "yes", "д", "да")
+
+
+def pause(message: str = "Нажмите Enter, чтобы выйти...") -> None:
+    try:
+        input(message)
+    except (EOFError, KeyboardInterrupt):
+        print()
 
 
 def cpu_name() -> str:
@@ -403,6 +445,43 @@ class PowerReader:
         return ", ".join(parts) if parts else "датчики PDH не найдены"
 
 
+def print_sensors(reader: PowerReader) -> None:
+    print("Доступные источники мощности:")
+    print("  ", reader.describe())
+    for key, (path, desc) in COUNTERS.items():
+        vals = _read_array(reader.handles.get(key))
+        print(f"  [{key}] {path}  ->  {desc}")
+        for name, val in list(vals.items())[:12]:
+            w = to_watts(val) if key in ("rapl", "meter") else None
+            extra = f"  (~{w:.2f} Вт)" if w else ""
+            print(f"        {name}: {val:.3f}{extra}")
+
+
+def interactive_menu(reader: PowerReader) -> float | None:
+    """Спрашивает режим теста. Возвращает длительность фазы или None (выход)."""
+    durations = {"2": 20.0, "3": 60.0, "4": 120.0}
+    print("PPW Bench — интерактивный режим")
+    print()
+    while True:
+        print("Что запустить?")
+        print("  1. Показать датчики мощности")
+        print("  2. Быстрый тест      — 20 с на фазу")
+        print("  3. Обычный тест      — 60 с на фазу")
+        print("  4. Длительный тест   — 120 с на фазу")
+        print("  0. Выход")
+        choice = ask_choice("Выбор [3]: ", {"0", "1", "2", "3", "4"}, "3")
+        print()
+        if choice == "0":
+            return None
+        if choice == "1":
+            print_sensors(reader)
+            print()
+            pause("Нажмите Enter, чтобы вернуться в меню...")
+            print()
+            continue
+        return durations[choice]
+
+
 class Sampler(threading.Thread):
     def __init__(self, reader: PowerReader, interval: float = 0.2) -> None:
         super().__init__(daemon=True)
@@ -697,30 +776,31 @@ def main() -> int:
                     help="задать мощность CPU вручную (если датчики недоступны)")
     ap.add_argument("--out", type=str, default=None, help="путь к .txt-отчёту")
     ap.add_argument("--list", action="store_true", help="показать датчики и выйти")
+    ap.add_argument("--interactive", action="store_true", help="запустить интерактивное меню")
     ap.add_argument("--version", action="version", version=f"ppw-bench {__version__}")
     args = ap.parse_args()
 
+    interactive = args.interactive or is_interactive()
     duration = 20.0 if args.quick else args.duration
-    if duration < 8:
-        ap.error("--duration должен быть >= 8 секунд")
+
+    if interactive:
+        reader = PowerReader()
+        reader.prime()
+        chosen = interactive_menu(reader)
+        if chosen is None:
+            return 0
+        duration = chosen
+    else:
+        if duration < 8:
+            ap.error("--duration должен быть >= 8 секунд")
+        reader = PowerReader()
+        reader.prime()
+        if args.list:
+            print_sensors(reader)
+            return 0
 
     logical = os.cpu_count() or 1
     mt_threads = args.threads if args.threads > 0 else logical
-
-    reader = PowerReader()
-    reader.prime()
-
-    if args.list:
-        print("Доступные источники мощности:")
-        print("  ", reader.describe())
-        for key, (path, desc) in COUNTERS.items():
-            vals = _read_array(reader.handles.get(key))
-            print(f"  [{key}] {path}  ->  {desc}")
-            for name, val in list(vals.items())[:12]:
-                w = to_watts(val) if key in ("rapl", "meter") else None
-                extra = f"  (~{w:.2f} Вт)" if w else ""
-                print(f"        {name}: {val:.3f}{extra}")
-        return 0
 
     exe = ensure_bench()
     exe = Path(exe)
@@ -811,34 +891,44 @@ def main() -> int:
         sampler.stop()
 
     report = build_report(meta, results, source)
-
-    if args.out:
-        out = Path(args.out)
-    else:
-        out = DATA_DIR / f"ppw-report-{datetime.now():%Y%m%d-%H%M%S}.txt"
-    if out.suffix.lower() != ".txt":
-        out = out.with_suffix(".txt")
-
-    try:
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(report + "\n", encoding="utf-8-sig")
-    except OSError as exc:
-        if args.out:
-            raise SystemExit(f"Не удалось сохранить отчёт: {out} ({exc})") from exc
-        # Папка с exe может быть доступна только для чтения — пишем в текущую.
-        fallback = Path.cwd() / out.name
-        try:
-            fallback.write_text(report + "\n", encoding="utf-8-sig")
-        except OSError as exc2:
-            raise SystemExit(
-                f"Не удалось сохранить отчёт: {out} ({exc}); {fallback} ({exc2})"
-            ) from exc2
-        out = fallback
-
     print()
     print(report)
     print()
-    print(f"Отчёт сохранён: {out}")
+
+    save = True
+    if interactive:
+        save = ask_yes_no("Сохранить отчёт в файл?", default=True)
+
+    if save:
+        if args.out:
+            out = Path(args.out)
+        else:
+            out = DATA_DIR / f"ppw-report-{datetime.now():%Y%m%d-%H%M%S}.txt"
+        if out.suffix.lower() != ".txt":
+            out = out.with_suffix(".txt")
+
+        try:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(report + "\n", encoding="utf-8-sig")
+        except OSError as exc:
+            if args.out:
+                raise SystemExit(f"Не удалось сохранить отчёт: {out} ({exc})") from exc
+            # Папка с exe может быть доступна только для чтения — пишем в текущую.
+            fallback = Path.cwd() / out.name
+            try:
+                fallback.write_text(report + "\n", encoding="utf-8-sig")
+            except OSError as exc2:
+                raise SystemExit(
+                    f"Не удалось сохранить отчёт: {out} ({exc}); {fallback} ({exc2})"
+                ) from exc2
+            out = fallback
+
+        print(f"Отчёт сохранён: {out}")
+    else:
+        print("Отчёт не сохранён (остался только в консоли).")
+
+    if interactive:
+        pause()
     return 0
 
 
