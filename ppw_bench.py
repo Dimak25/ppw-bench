@@ -398,20 +398,20 @@ class Sampler(threading.Thread):
         self.reader = reader
         self.interval = interval
         self.samples: list[dict[str, float]] = []
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
 
     def run(self) -> None:
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             t = time.perf_counter()
             vals = self.reader.read()
             if vals:
                 vals["t"] = t
                 self.samples.append(vals)  # type: ignore[arg-type]
-            if self._stop.wait(self.interval):
+            if self._stop_event.wait(self.interval):
                 break
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
         self.join(timeout=2.0)
 
 

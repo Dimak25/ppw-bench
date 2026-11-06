@@ -9,13 +9,17 @@ on:
 jobs:
   smoke:
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install MinGW-w64 (gcc)
         uses: msys2/setup-msys2@v2
@@ -32,12 +36,16 @@ jobs:
         run: python -m py_compile ppw_bench.py
 
       - name: Smoke run (8 s, no power sensors on CI)
-        run: python ppw_bench.py --duration 8 --no-st --out ci-report.txt
+        shell: pwsh
+        run: |
+          chcp 65001 | Out-Null
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          python ppw_bench.py --duration 8 --no-st --out ci-report.txt
 
       - name: Upload report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ppw-report
+          name: ppw-report-py${{ matrix.python-version }}
           path: ci-report.txt
           if-no-files-found: warn
