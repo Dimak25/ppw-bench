@@ -1,0 +1,23 @@
+# Сборка
+bench.exe
+*.o
+*.obj
+
+# Результаты тестов (у каждого свои)
+ppw-report-*.txt
+ci-report.txt
+results/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Редакторы / ОС
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store

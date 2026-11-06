@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install MinGW-w64 (gcc)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+
+      - name: Build benchmark
+        shell: msys2 {0}
+        run: gcc -O2 -static bench.c -o bench.exe
+
+      - name: Check Python syntax
+        run: python -m py_compile ppw_bench.py
+
+      - name: Smoke run (8 s, no power sensors on CI)
+        run: python ppw_bench.py --duration 8 --no-st --out ci-report.txt
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppw-report
+          path: ci-report.txt
+          if-no-files-found: warn
