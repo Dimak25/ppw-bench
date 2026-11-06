@@ -23,7 +23,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
 
       - name: Install MinGW-w64 (gcc)
         uses: msys2/setup-msys2@v2
@@ -60,16 +60,27 @@ jobs:
       - name: Install PyInstaller
         run: python -m pip install --upgrade pyinstaller
 
-      - name: Build portable exe
+      - name: Build portable folder
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --onedir --console `
+            --name ppw-bench --distpath dist --workpath build/onedir `
+            --add-binary "bench.exe;." ppw_bench.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build single-file exe
         shell: pwsh
         run: |
           python -m PyInstaller --noconfirm --clean --onefile --console `
-            --name ppw-bench --add-binary "bench.exe;." ppw_bench.py
+            --name ppw-bench --distpath dist --workpath build/onefile `
+            --add-binary "bench.exe;." ppw_bench.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Smoke test portable exe
+      - name: Smoke test portable builds
         shell: pwsh
         run: |
+          .\dist\ppw-bench\ppw-bench.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\dist\ppw-bench.exe --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\dist\ppw-bench.exe --duration 8 --no-st --out ci-portable-report.txt
@@ -80,7 +91,7 @@ jobs:
         run: |
           $stage = "dist/ppw-bench-$($env:TAG)-win64-portable"
           New-Item -ItemType Directory -Path $stage -Force | Out-Null
-          Copy-Item -LiteralPath "dist/ppw-bench.exe" $stage
+          Copy-Item -Path "dist/ppw-bench/*" -Destination $stage -Recurse
           Copy-Item -LiteralPath "README.md", "README.en.md", "LICENSE" $stage
           Compress-Archive -LiteralPath $stage `
             -DestinationPath "dist/ppw-bench-$($env:TAG)-win64-portable.zip"
@@ -103,27 +114,37 @@ jobs:
           body: |
             ## Portable (Windows 10/11 x64)
 
-            Готовый `ppw-bench.exe` — Python и gcc не нужны.
+            Python и gcc не нужны. Доступны два варианта:
 
-            * Скачайте `ppw-bench.exe` или ZIP-архив с README и LICENSE.
-            * Запустите `ppw-bench.exe` (двойной щелчок или `ppw-bench.exe --quick`).
-            * Отчёт `ppw-report-*.txt` сохраняется рядом с exe.
-            * SHA256 файлов — в `SHA256SUMS.txt`.
+            * `ppw-bench.exe` — один файл, удобнее всего.
+            * `ppw-bench-*-win64-portable.zip` — папка с exe и `_internal`.
+              **Рекомендуется, если антивирус жалуется на одиночный exe.**
 
-            > exe не подписан: SmartScreen может показать «Неизвестный издатель».
-            > Это нормально для открытой сборки — сверьте SHA256 с `SHA256SUMS.txt`.
+            Запуск: двойной щелчок или `ppw-bench.exe --quick`. Отчёт
+            `ppw-report-*.txt` сохраняется рядом с exe.
+
+            > **Ложное срабатывание антивируса.** Одиночный exe собран
+            > PyInstaller и не подписан. Эвристики (например, Microsoft Defender)
+            > иногда определяют такие файлы как `Trojan:Win32/Wacatac.H!ml`.
+            > Это ложное срабатывание: сверьте SHA256 с `SHA256SUMS.txt`,
+            > используйте ZIP-вариант или отправьте файл в Microsoft как FP.
 
             ## Portable (Windows 10/11 x64) — English
 
-            Ready-to-run `ppw-bench.exe`; Python and gcc are not required.
+            Python and gcc are not required. Two options:
 
-            * Download `ppw-bench.exe` or the ZIP with README and LICENSE.
-            * Run `ppw-bench.exe` (double-click or `ppw-bench.exe --quick`).
-            * The `ppw-report-*.txt` report is written next to the exe.
-            * Verify the downloads against `SHA256SUMS.txt`.
+            * `ppw-bench.exe` — a single file, the most convenient.
+            * `ppw-bench-*-win64-portable.zip` — a folder with the exe and
+              `_internal`. **Recommended if your antivirus flags the single exe.**
 
-            > The exe is unsigned, so SmartScreen may warn about an unknown
-            > publisher. This is expected for an open-source build — check SHA256.
+            Run it by double-clicking or with `ppw-bench.exe --quick`. The
+            `ppw-report-*.txt` report is written next to the exe.
+
+            > **Antivirus false positive.** The single-file exe is built with
+            > PyInstaller and is unsigned. Heuristics (e.g. Microsoft Defender)
+            > may flag it as `Trojan:Win32/Wacatac.H!ml`. This is a false
+            > positive: verify SHA256 against `SHA256SUMS.txt`, use the ZIP
+            > build, or submit the file to Microsoft as a false positive.
           files: |
             dist/ppw-bench.exe
             dist/ppw-bench-${{ env.TAG }}-win64-portable.zip

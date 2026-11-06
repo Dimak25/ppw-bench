@@ -57,11 +57,15 @@ gcc -O2 -static bench.c -o bench.exe
 
 ## Portable build (no Python or gcc)
 
-The ready-to-run `ppw-bench.exe` is available on the
+Ready-to-run builds are available on the
 [Releases](https://github.com/Dimak25/ppw-bench/releases/latest) page — Python
 and gcc are not required.
 
-1. Download `ppw-bench.exe` or the ZIP with README and LICENSE.
+* `ppw-bench.exe` — a single file, the most convenient option.
+* `ppw-bench-vX.Y.Z-win64-portable.zip` — a folder with the exe and `_internal`
+  (**recommended if your antivirus flags the single exe**).
+
+1. Download `ppw-bench.exe` or the ZIP.
 2. Run it by double-clicking or from a terminal:
 
    ```bat
@@ -70,9 +74,20 @@ and gcc are not required.
 
 3. The `ppw-report-*.txt` report is written next to the exe.
 
-> The exe is not code-signed, so Windows SmartScreen may warn about an unknown
-> publisher. This is expected for an open-source build: verify the downloaded
-> file's SHA256 against `SHA256SUMS.txt` from the release.
+### If antivirus reports Trojan:Win32/Wacatac.H!ml
+
+This is a known heuristic false positive on unsigned PyInstaller onefile builds.
+The program contains no network code or bundled third-party binaries.
+
+1. Verify the downloaded file's SHA256 against `SHA256SUMS.txt` from the release.
+2. Use the ZIP build — it is less likely to trigger such heuristics.
+3. Submit the file to Microsoft as a false positive:
+   <https://www.microsoft.com/en-us/wdsi/filesubmission>.
+4. If needed, add the program folder to Defender exclusions.
+
+> The exe is not code-signed, so Windows SmartScreen may also warn about an
+> unknown publisher. This is expected for an open-source build: verify SHA256
+> against `SHA256SUMS.txt` from the release.
 
 ## Usage
 

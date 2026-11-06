@@ -43,7 +43,7 @@ from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 HERE = Path(__file__).resolve().parent
 FROZEN = bool(getattr(sys, "frozen", False))

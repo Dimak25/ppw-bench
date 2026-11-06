@@ -57,11 +57,15 @@ gcc -O2 -static bench.c -o bench.exe
 
 ## Portable-версия (без Python и gcc)
 
-Готовый `ppw-bench.exe` лежит на странице
+Готовые сборки лежат на странице
 [Releases](https://github.com/Dimak25/ppw-bench/releases/latest) — Python и gcc
-для него не нужны.
+для них не нужны.
 
-1. Скачайте `ppw-bench.exe` или ZIP-архив с README и LICENSE.
+* `ppw-bench.exe` — один файл, самый удобный вариант.
+* `ppw-bench-vX.Y.Z-win64-portable.zip` — папка с exe и `_internal`
+  (**рекомендуется, если антивирус ругается на одиночный exe**).
+
+1. Скачайте `ppw-bench.exe` или ZIP-архив.
 2. Запустите двойным щелчком или из терминала:
 
    ```bat
@@ -70,9 +74,20 @@ gcc -O2 -static bench.c -o bench.exe
 
 3. Отчёт `ppw-report-*.txt` сохранится рядом с exe.
 
-> exe не подписан цифровой подписью, поэтому Windows SmartScreen может показать
+### Если антивирус пишет Trojan:Win32/Wacatac.H!ml
+
+Это известное ложное срабатывание эвристики на неподписанные onefile-сборки
+PyInstaller. В программе нет сетевого кода и посторонних файлов.
+
+1. Сверьте SHA256 скачанного файла с `SHA256SUMS.txt` из релиза.
+2. Используйте ZIP-сборку — она реже попадает под такие эвристики.
+3. Отправьте файл в Microsoft как false positive:
+   <https://www.microsoft.com/en-us/wdsi/filesubmission>.
+4. При необходимости добавьте папку с программой в исключения Defender.
+
+> exe не подписан цифровой подписью, поэтому SmartScreen также может показать
 > предупреждение «Неизвестный издатель». Это ожидаемо для открытой сборки:
-> сверьте SHA256 скачанного файла с `SHA256SUMS.txt` из релиза.
+> сверьте SHA256 с `SHA256SUMS.txt` из релиза.
 
 ## Использование
 

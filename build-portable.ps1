@@ -39,11 +39,28 @@ if (-not $SkipInstall) {
     }
 }
 
-Write-Host "==> Building portable exe"
-& $Python -m PyInstaller --noconfirm --clean --onefile --console --name ppw-bench `
-    --add-binary "bench.exe;." ppw_bench.py
+Write-Host "==> Building portable folder (recommended, fewer antivirus false positives)"
+& $Python -m PyInstaller --noconfirm --clean --onedir --console --name ppw-bench `
+    --distpath dist --workpath build\onedir --add-binary "bench.exe;." ppw_bench.py
 if ($LASTEXITCODE -ne 0) {
-    throw "PyInstaller failed with exit code $LASTEXITCODE"
+    throw "PyInstaller (onedir) failed with exit code $LASTEXITCODE"
+}
+
+$onedir = Join-Path $PWD "dist\ppw-bench"
+$onedirExe = Join-Path $onedir "ppw-bench.exe"
+if (-not (Test-Path -LiteralPath $onedirExe)) {
+    throw "Missing build artifact: $onedirExe"
+}
+& $onedirExe --version
+if ($LASTEXITCODE -ne 0) {
+    throw "Portable folder exe failed the version check"
+}
+
+Write-Host "==> Building single-file exe"
+& $Python -m PyInstaller --noconfirm --clean --onefile --console --name ppw-bench `
+    --distpath dist --workpath build\onefile --add-binary "bench.exe;." ppw_bench.py
+if ($LASTEXITCODE -ne 0) {
+    throw "PyInstaller (onefile) failed with exit code $LASTEXITCODE"
 }
 
 $exe = Join-Path $PWD "dist\ppw-bench.exe"
@@ -52,7 +69,7 @@ if (-not (Test-Path -LiteralPath $exe)) {
 }
 & $exe --version
 if ($LASTEXITCODE -ne 0) {
-    throw "Portable exe failed the version check"
+    throw "Single-file exe failed the version check"
 }
 
 Write-Host "==> Packing ZIP"
@@ -62,7 +79,7 @@ if (Test-Path -LiteralPath $stage) {
     Remove-Item -LiteralPath $stage -Recurse -Force
 }
 New-Item -ItemType Directory -Path $stage | Out-Null
-Copy-Item -LiteralPath $exe $stage
+Copy-Item -Path (Join-Path $onedir "*") $stage -Recurse
 Copy-Item -LiteralPath "README.md", "README.en.md", "LICENSE" $stage
 
 $zip = Join-Path $PWD "dist\$stageName.zip"
