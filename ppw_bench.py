@@ -19,6 +19,9 @@ ppw_bench.py - измерение Performance-per-Watt (PPW) для CPU.
     py ppw_bench.py --threads 8 --no-st  # только MT на 8 потоках
     py ppw_bench.py --watts 45           # если датчиков нет: задать мощность вручную
     py ppw_bench.py --list               # показать найденные датчики и выйти
+
+Portable-сборка (см. Releases) запускается так же:
+    ppw-bench.exe --quick
 """
 
 from __future__ import annotations
@@ -39,9 +42,17 @@ from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
 
+__version__ = "1.0.0"
+
 HERE = Path(__file__).resolve().parent
-BENCH_C = HERE / "bench.c"
-BENCH_EXE = HERE / ("bench.exe" if os.name == "nt" else "bench")
+FROZEN = bool(getattr(sys, "frozen", False))
+
+# В onefile-сборке PyInstaller ресурсы лежат во временной папке _MEIPASS,
+# а отчёты логичнее сохранять рядом с ppw-bench.exe.
+RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", HERE)) if FROZEN else HERE
+DATA_DIR = Path(sys.executable).resolve().parent if FROZEN else HERE
+BENCH_C = RESOURCE_DIR / "bench.c"
+BENCH_EXE = RESOURCE_DIR / ("bench.exe" if os.name == "nt" else "bench")
 
 # --------------------------------------------------------------------------
 #  Консоль / утилиты
@@ -436,6 +447,13 @@ def find_gcc() -> str | None:
 
 
 def ensure_bench() -> Path:
+    if FROZEN:
+        if BENCH_EXE.exists():
+            return BENCH_EXE
+        raise SystemExit(
+            "В Portable-сборке не найден встроенный bench.exe.\n"
+            "Скачайте релиз заново: https://github.com/Dimak25/ppw-bench/releases"
+        )
     if not BENCH_C.exists():
         raise SystemExit(f"Не найден исходник: {BENCH_C}")
     if BENCH_EXE.exists() and BENCH_EXE.stat().st_mtime >= BENCH_C.stat().st_mtime:
@@ -679,6 +697,7 @@ def main() -> int:
                     help="задать мощность CPU вручную (если датчики недоступны)")
     ap.add_argument("--out", type=str, default=None, help="путь к .txt-отчёту")
     ap.add_argument("--list", action="store_true", help="показать датчики и выйти")
+    ap.add_argument("--version", action="version", version=f"ppw-bench {__version__}")
     args = ap.parse_args()
 
     duration = 20.0 if args.quick else args.duration
@@ -793,11 +812,28 @@ def main() -> int:
 
     report = build_report(meta, results, source)
 
-    out = Path(args.out) if args.out else HERE / f"ppw-report-{datetime.now():%Y%m%d-%H%M%S}.txt"
+    if args.out:
+        out = Path(args.out)
+    else:
+        out = DATA_DIR / f"ppw-report-{datetime.now():%Y%m%d-%H%M%S}.txt"
     if out.suffix.lower() != ".txt":
         out = out.with_suffix(".txt")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(report + "\n", encoding="utf-8-sig")
+
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(report + "\n", encoding="utf-8-sig")
+    except OSError as exc:
+        if args.out:
+            raise SystemExit(f"Не удалось сохранить отчёт: {out} ({exc})") from exc
+        # Папка с exe может быть доступна только для чтения — пишем в текущую.
+        fallback = Path.cwd() / out.name
+        try:
+            fallback.write_text(report + "\n", encoding="utf-8-sig")
+        except OSError as exc2:
+            raise SystemExit(
+                f"Не удалось сохранить отчёт: {out} ({exc}); {fallback} ({exc2})"
+            ) from exc2
+        out = fallback
 
     print()
     print(report)

@@ -55,6 +55,25 @@ The build happens automatically. Manual build:
 gcc -O2 -static bench.c -o bench.exe
 ```
 
+## Portable build (no Python or gcc)
+
+The ready-to-run `ppw-bench.exe` is available on the
+[Releases](https://github.com/Dimak25/ppw-bench/releases/latest) page — Python
+and gcc are not required.
+
+1. Download `ppw-bench.exe` or the ZIP with README and LICENSE.
+2. Run it by double-clicking or from a terminal:
+
+   ```bat
+   ppw-bench.exe --quick
+   ```
+
+3. The `ppw-report-*.txt` report is written next to the exe.
+
+> The exe is not code-signed, so Windows SmartScreen may warn about an unknown
+> publisher. This is expected for an open-source build: verify the downloaded
+> file's SHA256 against `SHA256SUMS.txt` from the release.
+
 ## Usage
 
 ```bat
@@ -76,6 +95,7 @@ Or double-click `run.bat`.
 | `--watts N` | use a fixed CPU wattage (no sensors available) |
 | `--out FILE` | report path (default `ppw-report-*.txt`) |
 | `--list` | list detected sensors and exit |
+| `--version` | print the version and exit |
 
 ## Sample output
 
@@ -116,9 +136,12 @@ ppw-bench/
 ├── ppw_bench.py            # runner, power sampling, PPW, report
 ├── bench.c                 # C workload (Win32 threads)
 ├── run.bat                 # double-click launcher
+├── build-portable.ps1      # portable exe + ZIP build
 ├── README.md / README.en.md
 ├── LICENSE                 # MIT
-└── .github/workflows/ci.yml  # build + smoke test on GitHub Actions
+└── .github/workflows/
+    ├── ci.yml              # build + smoke test
+    └── release.yml         # publish the portable release on a tag
 ```
 
 `bench.exe` is a build artifact and is not committed (see `.gitignore`).

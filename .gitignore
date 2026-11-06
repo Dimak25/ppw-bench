@@ -2,6 +2,9 @@
 bench.exe
 *.o
 *.obj
+build/
+dist/
+*.spec
 
 # Результаты тестов (у каждого свои)
 ppw-report-*.txt

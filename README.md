@@ -55,6 +55,25 @@ py ppw_bench.py
 gcc -O2 -static bench.c -o bench.exe
 ```
 
+## Portable-версия (без Python и gcc)
+
+Готовый `ppw-bench.exe` лежит на странице
+[Releases](https://github.com/Dimak25/ppw-bench/releases/latest) — Python и gcc
+для него не нужны.
+
+1. Скачайте `ppw-bench.exe` или ZIP-архив с README и LICENSE.
+2. Запустите двойным щелчком или из терминала:
+
+   ```bat
+   ppw-bench.exe --quick
+   ```
+
+3. Отчёт `ppw-report-*.txt` сохранится рядом с exe.
+
+> exe не подписан цифровой подписью, поэтому Windows SmartScreen может показать
+> предупреждение «Неизвестный издатель». Это ожидаемо для открытой сборки:
+> сверьте SHA256 скачанного файла с `SHA256SUMS.txt` из релиза.
+
 ## Использование
 
 ```bat
@@ -76,6 +95,7 @@ py ppw_bench.py --list          :: показать датчики мощнос�
 | `--watts N` | считать PPW по заданной мощности (если датчиков нет) |
 | `--out FILE` | путь к `.txt`-отчёту (по умолчанию `ppw-report-*.txt`) |
 | `--list` | показать найденные датчики и выйти |
+| `--version` | показать версию и выйти |
 
 ## Пример вывода
 
@@ -116,9 +136,12 @@ ppw-bench/
 ├── ppw_bench.py            # запуск, снятие мощности, расчёт, отчёт
 ├── bench.c                 # C-нагрузка (Win32-потоки)
 ├── run.bat                 # запуск двойным щелчком
+├── build-portable.ps1      # сборка Portable exe + ZIP
 ├── README.md / README.en.md
 ├── LICENSE                 # MIT
-└── .github/workflows/ci.yml  # сборка + smoke-тест на GitHub Actions
+└── .github/workflows/
+    ├── ci.yml              # сборка + smoke-тест
+    └── release.yml         # публикация Portable-релиза по тегу
 ```
 
 `bench.exe` — артефакт сборки, в репозиторий не входит (см. `.gitignore`).

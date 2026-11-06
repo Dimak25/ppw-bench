@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, e.g. v1.0.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install MinGW-w64 (gcc)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+
+      - name: Build benchmark
+        shell: msys2 {0}
+        run: gcc -O2 -static bench.c -o bench.exe
+
+      - name: Check tag matches version
+        shell: pwsh
+        run: |
+          $tag = if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            "${{ inputs.tag }}"
+          } else {
+            "${{ github.ref_name }}"
+          }
+          if (-not $tag) { throw "No release tag provided" }
+
+          $src = Get-Content -LiteralPath ppw_bench.py -Raw -Encoding utf8
+          if ($src -notmatch '__version__\s*=\s*"([^"]+)"') {
+            throw "Cannot read __version__ from ppw_bench.py"
+          }
+          $version = $Matches[1]
+          if ($tag -ne "v$version") {
+            throw "Tag '$tag' does not match __version__ 'v$version'"
+          }
+          "TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Releasing $tag (version $version)"
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pyinstaller
+
+      - name: Build portable exe
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --console `
+            --name ppw-bench --add-binary "bench.exe;." ppw_bench.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Smoke test portable exe
+        shell: pwsh
+        run: |
+          .\dist\ppw-bench.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\dist\ppw-bench.exe --duration 8 --no-st --out ci-portable-report.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Pack release assets
+        shell: pwsh
+        run: |
+          $stage = "dist/ppw-bench-$($env:TAG)-win64-portable"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item -LiteralPath "dist/ppw-bench.exe" $stage
+          Copy-Item -LiteralPath "README.md", "README.en.md", "LICENSE" $stage
+          Compress-Archive -LiteralPath $stage `
+            -DestinationPath "dist/ppw-bench-$($env:TAG)-win64-portable.zip"
+
+          $assets = @(
+            "dist/ppw-bench.exe",
+            "dist/ppw-bench-$($env:TAG)-win64-portable.zip"
+          )
+          $lines = foreach ($file in $assets) {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLower()
+            "$hash  $(Split-Path -Leaf $file)"
+          }
+          $lines | Set-Content -LiteralPath "dist/SHA256SUMS.txt" -Encoding ascii
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: PPW Bench ${{ env.TAG }}
+          body: |
+            ## Portable (Windows 10/11 x64)
+
+            Готовый `ppw-bench.exe` — Python и gcc не нужны.
+
+            * Скачайте `ppw-bench.exe` или ZIP-архив с README и LICENSE.
+            * Запустите `ppw-bench.exe` (двойной щелчок или `ppw-bench.exe --quick`).
+            * Отчёт `ppw-report-*.txt` сохраняется рядом с exe.
+            * SHA256 файлов — в `SHA256SUMS.txt`.
+
+            > exe не подписан: SmartScreen может показать «Неизвестный издатель».
+            > Это нормально для открытой сборки — сверьте SHA256 с `SHA256SUMS.txt`.
+
+            ## Portable (Windows 10/11 x64) — English
+
+            Ready-to-run `ppw-bench.exe`; Python and gcc are not required.
+
+            * Download `ppw-bench.exe` or the ZIP with README and LICENSE.
+            * Run `ppw-bench.exe` (double-click or `ppw-bench.exe --quick`).
+            * The `ppw-report-*.txt` report is written next to the exe.
+            * Verify the downloads against `SHA256SUMS.txt`.
+
+            > The exe is unsigned, so SmartScreen may warn about an unknown
+            > publisher. This is expected for an open-source build — check SHA256.
+          files: |
+            dist/ppw-bench.exe
+            dist/ppw-bench-${{ env.TAG }}-win64-portable.zip
+            dist/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
