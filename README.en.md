@@ -3,7 +3,7 @@
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/platform-Windows-lightgrey)](#requirements)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![CI](https://github.com/dimak005/ppw-bench/actions/workflows/ci.yml/badge.svg)](https://github.com/dimak005/ppw-bench/actions/workflows/ci.yml)
+[![CI](https://github.com/Dimak25/ppw-bench/actions/workflows/ci.yml/badge.svg)](https://github.com/Dimak25/ppw-bench/actions/workflows/ci.yml)
 
 [Русский](README.md) | **English**
 
@@ -44,7 +44,7 @@ other applications closed.
 ## Install
 
 ```bat
-git clone https://github.com/dimak005/ppw-bench.git
+git clone https://github.com/Dimak25/ppw-bench.git
 cd ppw-bench
 py ppw_bench.py
 ```
@@ -146,4 +146,15 @@ there — the pipeline only validates that everything runs.
 
 ## License
 
-[MIT](LICENSE) © 2026 dimak005
+[MIT](LICENSE) © 2026 Dimak25
+
+## About this project
+
+The project was built with the help of a neural network (AI assistant) and was
+originally created for personal use — comparing laptops with different CPUs by
+efficiency (performance per watt). Anyone is free to use it: the code is open,
+licensed under MIT, so fork it, change it and adapt it to your needs.
+
+The author does not guarantee correct measurements on every machine: the set of
+available power sensors depends on the platform and drivers. Check the numbers on
+your own hardware — `--list` shows what is available.

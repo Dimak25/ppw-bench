@@ -3,7 +3,7 @@
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/platform-Windows-lightgrey)](#требования)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![CI](https://github.com/dimak005/ppw-bench/actions/workflows/ci.yml/badge.svg)](https://github.com/dimak005/ppw-bench/actions/workflows/ci.yml)
+[![CI](https://github.com/Dimak25/ppw-bench/actions/workflows/ci.yml/badge.svg)](https://github.com/Dimak25/ppw-bench/actions/workflows/ci.yml)
 
 **Русский** | [English](README.en.md)
 
@@ -44,7 +44,7 @@ PPW = (работа / секунда) / (средняя мощность, Вт)
 ## Установка
 
 ```bat
-git clone https://github.com/dimak005/ppw-bench.git
+git clone https://github.com/Dimak25/ppw-bench.git
 cd ppw-bench
 py ppw_bench.py
 ```
@@ -146,4 +146,15 @@ GitHub Actions на `windows-latest` собирает `bench.c` через MinGW
 
 ## Лицензия
 
-[MIT](LICENSE) © 2026 dimak005
+[MIT](LICENSE) © 2026 Dimak25
+
+## О проекте
+
+Проект написан с помощью нейросети (AI-ассистента) и изначально делался под
+себя — чтобы сравнивать ноутбуки с разными процессорами по эффективности
+(производительность на ватт). Пользоваться может каждый: код открыт, лицензия
+MIT, форкайте, меняйте и адаптируйте под свои задачи.
+
+Автор не гарантирует корректность замеров на любом железе: набор доступных
+датчиков мощности зависит от платформы и драйверов. Проверяйте цифры на своей
+машине — команда `--list` покажет, что доступно.
