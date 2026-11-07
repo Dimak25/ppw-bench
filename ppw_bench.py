@@ -373,11 +373,13 @@ def _read_array(handle) -> dict[str, float]:
 
 
 def to_watts(raw: float | None) -> float | None:
-    """Драйверы RAPL/Power Meter на Windows обычно отдают мВт.
-    Значения > 500 Вт в ваттах нереальны для CPU, поэтому это мВт."""
+    """Счётчики \\Energy Meter\\Power и \\Power Meter\\Power отдают милливатты.
+
+    Единицы фиксированы: раньше они угадывались по величине (> 500 -> мВт),
+    из-за чего 300 мВт в простое превращались в «300 Вт»."""
     if raw is None or raw <= 0:
         return None
-    return raw / 1000.0 if raw > 500 else raw
+    return raw / 1000.0
 
 
 class PowerReader:
@@ -578,11 +580,17 @@ def interp_work(points: list[tuple[float, float]], elapsed_ms: float) -> float:
     return y0 + (y1 - y0) * (elapsed_ms - x0) / (x1 - x0)
 
 
+def warmup_seconds(duration: float) -> float:
+    """Сколько секунд в начале фазы отбрасывается как прогрев (буст PL2)."""
+    return min(max(8.0, duration * 0.25), duration * 0.45)
+
+
 def run_phase(exe: Path, threads: int, duration: float, sampler: Sampler) -> dict:
     proc = subprocess.Popen(
         [str(exe), str(threads), f"{duration:.3f}"],
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        # stderr никто не читает: PIPE мог бы переполниться и подвесить bench
+        stderr=subprocess.DEVNULL,
         bufsize=0,
     )
     assert proc.stdout is not None
@@ -611,14 +619,19 @@ def run_phase(exe: Path, threads: int, duration: float, sampler: Sampler) -> dic
                 elif parts[0] == "DONE" and len(parts) >= 3:
                     t_end = now
                     ticks.append((float(parts[1]), float(parts[2])))
-    finally:
         proc.wait(timeout=10)
+    except BaseException:
+        # Ctrl+C, ошибка разбора и т.п.: не оставляем bench грузить CPU
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        raise
 
     if t_start is None or t_end is None or t_end <= t_start:
         raise RuntimeError("бенчмарк не сообщил START/DONE")
 
     # окно установившегося режима: отбрасываем прогрев и хвост
-    warmup = min(max(8.0, duration * 0.25), duration * 0.45)
+    warmup = warmup_seconds(duration)
     w_start = t_start + warmup
     w_end = t_end - 0.3
     if w_end <= w_start:
@@ -679,12 +692,43 @@ def run_phase(exe: Path, threads: int, duration: float, sampler: Sampler) -> dic
         "sys_w": sysw,
         "pkg_cv": cv("pkg"),
         "rate_cv": rate_cv,
-        "energy_j": pkg * steady if pkg else None,
         "ppw_pkg": work_per_s / pkg if pkg else None,
         "ppw_sys": work_per_s / sysw if sysw else None,
+        # заполняются в apply_power_basis()
+        "basis": None,
+        "power_w": None,
+        "ppw": None,
+        "energy_j": None,
         "samples": len(window),
         "time_s": datetime.now(),
     }
+
+
+BASIS_LABELS = {
+    "pkg": "по мощности пакета",
+    "sys": "по мощности системы",
+    "manual": "по заданной вручную мощности",
+}
+
+
+def apply_power_basis(res: dict, manual: float | None) -> dict:
+    """Выбирает, по какой мощности считается итоговый PPW, и запоминает это.
+
+    Раньше PPW по мощности системы записывался в ppw_pkg и в отчёте
+    выглядел как «PPW (пакет)» — теперь источник хранится явно."""
+    if manual:
+        basis, power = "manual", manual
+    elif res["pkg_w"]:
+        basis, power = "pkg", res["pkg_w"]
+    elif res["sys_w"]:
+        basis, power = "sys", res["sys_w"]
+    else:
+        basis, power = None, None
+    res["basis"] = basis
+    res["power_w"] = power
+    res["ppw"] = res["work_per_s"] / power if power else None
+    res["energy_j"] = power * res["steady"] if power else None
+    return res
 
 
 # --------------------------------------------------------------------------
@@ -716,8 +760,11 @@ def build_report(meta: dict, phases: list[dict], source: str) -> str:
     for i, ph in enumerate(phases, 1):
         kind = "MULTI-THREAD" if ph["threads"] > 1 else "SINGLE-THREAD"
         L.append(f"ФАЗА {i} — {kind} ({ph['threads']} поток(ов))")
-        L.append(f"  Производительность : {fmt_si(ph['work_per_s'], 'ед/с')}")
+        L.append(f"  Производительность  : {fmt_si(ph['work_per_s'], 'ед/с')}")
         L.append(f"  Работа за тест      : {fmt_si(ph['total_work'], 'ед')}")
+        basis = ph.get("basis")
+        if basis == "manual":
+            L.append(f"  Мощность (вручную)  : {ph['power_w']:.2f} Вт")
         if ph["pkg_w"]:
             L.append(f"  Ср. мощность CPU    : {ph['pkg_w']:.2f} Вт (пакет)")
         if ph["pp0_w"]:
@@ -725,7 +772,10 @@ def build_report(meta: dict, phases: list[dict], source: str) -> str:
         if ph["sys_w"]:
             L.append(f"  Ср. мощность системы: {ph['sys_w']:.2f} Вт")
         if ph["energy_j"]:
-            L.append(f"  Энергия (пакет)     : {ph['energy_j']:.0f} Дж")
+            tag = {"pkg": "пакет", "sys": "система", "manual": "вручную"}[basis]
+            L.append(f"  {'Энергия (' + tag + ')':<20}: {ph['energy_j']:.0f} Дж")
+        if basis == "manual":
+            L.append(f"  PPW (вручную)       : {fmt_si(ph['ppw'], 'ед/с на Вт')}")
         if ph["ppw_pkg"]:
             L.append(f"  PPW (пакет)         : {fmt_si(ph['ppw_pkg'], 'ед/с на Вт')}")
         if ph["ppw_sys"]:
@@ -743,10 +793,8 @@ def build_report(meta: dict, phases: list[dict], source: str) -> str:
     L.append("ИТОГ")
     for ph in phases:
         kind = "MT" if ph["threads"] > 1 else "ST"
-        if ph["ppw_pkg"]:
-            L.append(f"  {kind}: {fmt_si(ph['ppw_pkg'], 'ед/с на Вт')} (по мощности пакета)")
-        elif ph["ppw_sys"]:
-            L.append(f"  {kind}: {fmt_si(ph['ppw_sys'], 'ед/с на Вт')} (по мощности системы)")
+        if ph.get("ppw"):
+            L.append(f"  {kind}: {fmt_si(ph['ppw'], 'ед/с на Вт')} ({BASIS_LABELS[ph['basis']]})")
         else:
             L.append(f"  {kind}: PPW не измерен (нет датчика мощности)")
     L.append(bar)
@@ -770,8 +818,9 @@ def main() -> int:
     ap.add_argument("--duration", type=float, default=60.0, help="секунд на фазу")
     ap.add_argument("--quick", action="store_true", help="быстрый режим: 20 с на фазу")
     ap.add_argument("--threads", type=int, default=0, help="потоков в MT-фазе (0 = все)")
-    ap.add_argument("--no-st", action="store_true", help="не запускать single-thread фазу")
-    ap.add_argument("--only-st", action="store_true", help="только single-thread фаза")
+    phase_group = ap.add_mutually_exclusive_group()
+    phase_group.add_argument("--no-st", action="store_true", help="не запускать single-thread фазу")
+    phase_group.add_argument("--only-st", action="store_true", help="только single-thread фаза")
     ap.add_argument("--watts", type=float, default=None,
                     help="задать мощность CPU вручную (если датчики недоступны)")
     ap.add_argument("--out", type=str, default=None, help="путь к .txt-отчёту")
@@ -833,9 +882,6 @@ def main() -> int:
     if not args.no_st:
         phases_spec.append((1, "ST"))
 
-    if not phases_spec:
-        phases_spec = [(mt_threads, "MT")]
-
     meta = {
         "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "cpu": cpu_name(),
@@ -844,7 +890,7 @@ def main() -> int:
         "os": platform.platform(),
         "power": power_note,
         "duration": duration,
-        "warmup": min(max(8.0, duration * 0.25), duration * 0.45),
+        "warmup": warmup_seconds(duration),
         "warnings": warnings,
     }
 
@@ -865,22 +911,10 @@ def main() -> int:
         for threads, tag in phases_spec:
             kind = "MULTI-THREAD" if threads > 1 else "SINGLE-THREAD"
             print(f"[{tag}] {kind}, {threads} поток(ов), {duration:.0f} с ...", flush=True)
-            res = run_phase(exe, threads, duration, sampler)
-
-            if manual:
-                res["pkg_w"] = manual
-                res["ppw_pkg"] = res["work_per_s"] / manual
-                res["energy_j"] = manual * res["steady"]
-            elif res["pkg_w"] is None and res["sys_w"] is not None:
-                # RAPL нет — считаем PPW по мощности системы
-                res["ppw_pkg"] = res["work_per_s"] / res["sys_w"]
-                res["energy_j"] = res["sys_w"] * res["steady"]
-            elif res["pkg_w"] is None and res["sys_w"] is None:
-                res["ppw_pkg"] = None
-
+            res = apply_power_basis(run_phase(exe, threads, duration, sampler), manual)
             results.append(res)
-            ppw = res["ppw_pkg"] or res["ppw_sys"]
-            power = res["pkg_w"] or res["sys_w"]
+            ppw = res["ppw"]
+            power = res["power_w"]
             print(
                 f"     {fmt_si(res['work_per_s'], 'ед/с')}"
                 + (f"   {power:.1f} Вт" if power else "")
