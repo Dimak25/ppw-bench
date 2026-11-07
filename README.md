@@ -1,7 +1,7 @@
 # PPW Bench — производительность на ватт
 
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
-[![Platform](https://img.shields.io/badge/platform-Windows-lightgrey)](#требования)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey)](#требования)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![CI](https://github.com/Dimak25/ppw-bench/actions/workflows/ci.yml/badge.svg)](https://github.com/Dimak25/ppw-bench/actions/workflows/ci.yml)
 
@@ -15,31 +15,46 @@ PPW = (работа / секунда) / (средняя мощность, Вт)
 ```
 
 Один скрипт запускает детерминированную нагрузку на C, параллельно снимает
-реальную мощность CPU через счётчики Windows (RAPL) и сохраняет отчёт в `.txt`.
-Создан для Intel Core Ultra 9 185H, но работает на любом Windows-ПК/ноутбуке,
-где доступны счётчики энергии.
+реальную мощность CPU (RAPL) и сохраняет отчёт в `.txt`. Мощность берётся из
+счётчиков Windows или из `powercap` в Linux. Создан для Intel Core Ultra 9 185H,
+но работает на любом ПК/ноутбуке с Windows или Linux, где доступны счётчики
+энергии (Intel, AMD Zen).
 
 ## Возможности
 
-* Нагрузка на C (Win32-потоки): целочисленные цепочки + плавающая точка,
-  одинаковый объём работы на любой машине — баллы сравнимы между прогонами.
+* Нагрузка на C (Win32-потоки / pthreads): целочисленные цепочки + плавающая
+  точка, одинаковый объём работы на любой машине — баллы сравнимы между
+  прогонами. Версия компилятора пишется в отчёт.
 * Многопоточная и однопоточная фазы.
-* Мощность: RAPL (пакет CPU и ядра) + системный `Power Meter` как fallback.
+* Мощность: RAPL (пакет CPU и ядра) + мощность системы как fallback
+  (`Power Meter` в Windows, `psys` / батарея в Linux). В Linux используется сам
+  счётчик энергии (ΔE/Δt) — это точнее усреднения сэмплов.
+* Пауза на охлаждение между многопоточной и однопоточной фазами.
 * Корректный учёт прогрева: буст PL2 отбрасывается, считается установившийся режим.
 * Показатель стабильности (разброс мощности и скорости) — видно, можно ли верить цифрам.
-* Предупреждения: работа от батареи, схема «Экономия энергии», фоновая нагрузка.
-* Отчёт в `.txt` (UTF-8 с BOM — нормально открывается в Блокноте).
+* Предупреждения: работа от батареи, энергосберегающая схема/профиль, фоновая нагрузка.
+* Отчёт в `.txt` (в Windows — UTF-8 с BOM, нормально открывается в Блокноте).
 * Без внешних Python-зависимостей.
 
 ## Требования
+
+### Windows
 
 * Windows 10/11.
 * Python 3.9+ (`py` или `python` в PATH).
 * **gcc** — MinGW-w64 или TDM-GCC (`gcc --version`).
   `bench.exe` собирается автоматически при первом запуске.
 
+### Linux
+
+* Любой дистрибутив x86_64, ядро с `intel_rapl_common` (Intel, AMD Zen).
+* Python 3.9+ (`python3`) и `gcc` — или готовый релиз, см. ниже.
+* Доступ к RAPL: с ядра 5.10 `energy_uj` читает только root, поэтому запуск
+  через `sudo` или один раз установить udev-правило (см. [Linux](#linux)).
+
 Для честного замера: питание от сети, схема «Сбалансированная» или
-«Высокая производительность», закрытые лишние программы.
+«Высокая производительность» (в Linux — `powerprofilesctl set balanced`),
+закрытые лишние программы.
 
 ## Установка
 
@@ -55,7 +70,50 @@ py ppw_bench.py
 gcc -O2 -static bench.c -o bench.exe
 ```
 
-## Portable-версия (без Python и gcc)
+## Linux
+
+Из репозитория:
+
+```bash
+git clone https://github.com/Dimak25/ppw-bench.git
+cd ppw-bench
+sudo python3 ppw_bench.py --quick   # bench соберётся через gcc сам
+```
+
+Готовые сборки на странице [Releases](https://github.com/Dimak25/ppw-bench/releases/latest):
+
+* `ppw-bench-vX.Y.Z-linux-x86_64.tar.gz` — скрипт + статический `bench`
+  (~400 КБ). Нужен только `python3` ≥ 3.9, он есть почти в любом дистрибутиве.
+* `ppw-bench-vX.Y.Z-linux-x86_64` — самостоятельный бинарник (Nuitka), Python
+  не нужен (~11 МБ, glibc ≥ 2.35: Ubuntu 22.04+, Debian 12+, Fedora 36+).
+
+```bash
+tar xzf ppw-bench-v*-linux-x86_64.tar.gz
+cd ppw-bench-v*-linux-x86_64
+sudo ./ppw-bench --quick
+```
+
+```bash
+chmod +x ppw-bench-v*-linux-x86_64
+sudo ./ppw-bench-v*-linux-x86_64 --quick
+```
+
+При запуске через `sudo` отчёт передаётся вашему пользователю, а не root.
+
+### RAPL без sudo (udev)
+
+Правило даёт право чтения `energy_uj` только группе `powercap` (не всем:
+доступ к счётчикам закрыт из-за атаки Platypus, CVE-2020-8694), а скрипт
+добавляет вас в эту группу:
+
+```bash
+sudo ./install-udev.sh        # в репозитории: sudo packaging/linux/install-udev.sh
+```
+
+После этого перелогиньтесь (или выполните `newgrp powercap`). Удаление:
+`sudo ./install-udev.sh --uninstall`.
+
+## Portable-версия для Windows (без Python и gcc)
 
 Готовые сборки лежат на странице
 [Releases](https://github.com/Dimak25/ppw-bench/releases/latest) — Python и gcc
@@ -111,6 +169,7 @@ py ppw_bench.py --list          :: показать датчики мощнос�
 | `--threads N` | потоков в многопоточной фазе (по умолчанию — все) |
 | `--no-st` | только многопоточная фаза |
 | `--only-st` | только однопоточная фаза |
+| `--cooldown N` | пауза между фазами, с (по умолчанию 10; 0 — без паузы) |
 | `--watts N` | считать PPW по заданной мощности (если датчиков нет) |
 | `--out FILE` | путь к `.txt`-отчёту (по умолчанию `ppw-report-*.txt`) |
 | `--list` | показать найденные датчики и выйти |
@@ -140,12 +199,13 @@ py ppw_bench.py --list          :: показать датчики мощнос�
 
 ## Как это работает
 
-1. `ppw_bench.py` собирает `bench.c` в `bench.exe` (если нужно).
+1. `ppw_bench.py` собирает `bench.c` в `bench.exe` / `bench` (если нужно).
 2. Запускает фазу: C-нагрузка печатает прогресс раз в секунду.
-3. Параллельный поток читает PDH-счётчики:
-   * `\Energy Meter(*)\Power` — RAPL, мощность пакета/ядер;
-   * `\Power Meter(*)\Power` — мощность системы;
-   * `\Processor Information(_Total)\% Processor Performance` — служебный.
+3. Параллельный поток читает датчики мощности:
+   * **Windows**, PDH-счётчики: `\Energy Meter(*)\Power` (RAPL, пакет/ядра),
+     `\Power Meter(*)\Power` (система);
+   * **Linux**, `powercap`: `intel-rapl:N/energy_uj` (`package-N`), подзона
+     `core`, `psys`; как fallback — `power_now` батареи.
 4. Берётся окно после прогрева, в нём усредняются мощность и скорость.
 5. `PPW = работа/с ÷ ватты`, отчёт пишется в `.txt`.
 
@@ -153,10 +213,20 @@ py ppw_bench.py --list          :: показать датчики мощнос�
 
 ```
 ppw-bench/
-├── ppw_bench.py            # запуск, снятие мощности, расчёт, отчёт
-├── bench.c                 # C-нагрузка (Win32-потоки)
-├── run.bat                 # запуск двойным щелчком
-├── build-portable.ps1      # сборка Portable exe + ZIP
+├── ppw_bench.py            # точка входа
+├── ppwbench/
+│   ├── cli.py              # командная строка, меню
+│   ├── core.py             # сборка bench, фазы, расчёт PPW
+│   ├── report.py           # отчёт
+│   └── platforms/
+│       ├── windows.py      # PDH, реестр, powercfg
+│       └── linux.py        # powercap, /proc, /sys
+├── bench.c                 # C-нагрузка (Win32-потоки / pthreads)
+├── tests/                  # pytest
+├── run.bat                 # запуск двойным щелчком (Windows)
+├── build-portable.ps1      # Windows: Portable exe + ZIP
+├── build-linux.sh          # Linux: tar.gz + Nuitka onefile
+├── packaging/linux/        # udev-правило, install-udev.sh, лаунчер
 ├── README.md / README.en.md
 ├── LICENSE                 # MIT
 └── .github/workflows/
@@ -164,14 +234,18 @@ ppw-bench/
     └── release.yml         # публикация Portable-релиза по тегу
 ```
 
-`bench.exe` — артефакт сборки, в репозиторий не входит (см. `.gitignore`).
+`bench.exe` / `bench` — артефакты сборки, в репозиторий не входят (см. `.gitignore`).
 
 ## Если PPW не считается
 
 * `--list` пустой или «датчики PDH не найдены» — нет провайдера `Energy Meter`.
   Используйте `--watts N` (мощность CPU в ваттах) или внешний ваттметр.
 * Датчик есть, но PPW пустой — он вернул 0; проверьте `--list`.
-* `Не найден gcc` — установите MinGW-w64/TDM-GCC или соберите `bench.exe` вручную.
+* `Не найден компилятор C` — установите MinGW-w64/TDM-GCC (Windows) или `gcc`
+  (Linux), либо возьмите готовый релиз.
+* Linux: «RAPL найден, но нет прав» — запустите через `sudo` или установите udev-правило.
+* Linux: нет зон `intel-rapl` — `sudo modprobe intel_rapl_common`. В виртуальной
+  машине RAPL обычно недоступен.
 
 ## Советы для сравнимых результатов
 
@@ -183,8 +257,8 @@ ppw-bench/
 
 ## CI
 
-GitHub Actions на `windows-latest` собирает `bench.c` через MinGW-w64 и делает
-короткий smoke-прогон. Мощность на CI-раннерах недоступна, поэтому там PPW = n/a —
+GitHub Actions на `windows-latest` и `ubuntu-latest` собирает `bench.c`,
+запускает юнит-тесты и короткий smoke-прогон. Мощность на CI-раннерах недоступна, поэтому там PPW = n/a —
 проверяется сама работоспособность пайплайна.
 
 ## Лицензия

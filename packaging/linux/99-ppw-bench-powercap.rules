@@ -1,0 +1,9 @@
+# PPW Bench: let members of the "powercap" group read RAPL energy counters.
+#
+# Since Linux 5.10 /sys/class/powercap/intel-rapl*/energy_uj is readable by
+# root only (CVE-2020-8694, "Platypus"). This rule grants read access to the
+# "powercap" group instead of everyone, so only users you add to the group
+# can read the counters. Installed by install-udev.sh.
+SUBSYSTEM=="powercap", KERNEL=="intel-rapl:*", ACTION=="add", \
+    RUN+="/bin/chgrp powercap /sys%p/energy_uj", \
+    RUN+="/bin/chmod g+r /sys%p/energy_uj"

@@ -28,7 +28,8 @@ PROCFS = Path("/proc")
 UDEV_HINT = (
     "Счётчики RAPL есть, но читать их может только root (так в ядре с 5.10). "
     "Запустите через sudo или один раз установите правило udev: "
-    "sudo ./install-udev.sh — и перелогиньтесь."
+    "sudo ./install-udev.sh (в архиве релиза; в репозитории — "
+    "packaging/linux/install-udev.sh) — и перелогиньтесь."
 )
 
 

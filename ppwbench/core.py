@@ -65,10 +65,23 @@ def compile_commands(cc: str, src: Path, out: Path) -> list[list[str]]:
     return [base[:2] + ["-static", "-pthread"] + base[2:], base[:2] + ["-pthread"] + base[2:]]
 
 
+def _make_executable(exe: Path) -> None:
+    """Распаковщики (Nuitka onefile, zip) не всегда сохраняют бит +x."""
+    if util.IS_WINDOWS:
+        return
+    try:
+        mode = exe.stat().st_mode
+        if not mode & 0o111:
+            exe.chmod(mode | 0o755)
+    except OSError:
+        pass
+
+
 def ensure_bench(backend) -> Path:
     exe = util.BENCH_EXE
     if util.FROZEN:
         if exe.exists():
+            _make_executable(exe)
             return exe
         raise SystemExit(
             f"В Portable-сборке не найден встроенный {exe.name}.\n"
@@ -76,10 +89,15 @@ def ensure_bench(backend) -> Path:
         )
     src = util.BENCH_C
     if exe.exists() and (not src.exists() or exe.stat().st_mtime >= src.stat().st_mtime):
+        _make_executable(exe)
         return exe
     if not src.exists():
         raise SystemExit(f"Не найден исходник: {src}")
     cc = find_compiler(backend.compiler_candidates())
+    if not cc and exe.exists():
+        # готовый bench из архива релиза: компилятора нет — используем его
+        _make_executable(exe)
+        return exe
     if not cc:
         if util.IS_WINDOWS:
             hint = "Установите MinGW-w64 / TDM-GCC (или добавьте gcc в PATH)"
