@@ -1,9 +1,14 @@
 /*
  * bench.c - deterministic mixed integer/FP CPU workload for PPW measurement.
  *
- * Usage: bench.exe <threads> <seconds> [inner]
+ * Builds on Windows (Win32 threads, MinGW-w64) and Linux/POSIX (pthreads):
+ *   gcc -O2 -static bench.c -o bench.exe            (Windows)
+ *   gcc -O2 -static -pthread bench.c -o bench       (Linux)
+ *
+ * Usage: bench <threads> <seconds> [inner]
  *
  * Emits on stdout:
+ *   BUILD <compiler version>
  *   THREADS <n>
  *   START
  *   TICK <elapsed_ms> <total_work_units>      (once per second)
@@ -17,18 +22,43 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdatomic.h>
+
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <pthread.h>
+#include <time.h>
+#endif
 
 #ifndef DEFAULT_INNER
 #define DEFAULT_INNER 4096
 #endif
 
-static _Atomic unsigned long long g_work = 0;
-static volatile LONG g_stop = 0;
-static volatile uint64_t g_sink = 0;
-static LARGE_INTEGER g_t0, g_freq;
+/* One slot per worker, padded to its own cache line: a single shared atomic
+ * counter makes every core fight over one line, which on many-core CPUs costs
+ * both throughput and watts and skews the very thing being measured. */
+typedef struct {
+    _Atomic unsigned long long work;
+    uint64_t sink;
+    char pad[64 - sizeof(unsigned long long) - sizeof(uint64_t)];
+} slot_t;
+
+static slot_t *g_slots = NULL;
+static int g_threads = 1;
+static atomic_int g_stop = 0;
 static int g_inner = DEFAULT_INNER;
 static double g_seconds = 30.0;
+static volatile uint64_t g_sink = 0;
+
+/* ---------------------------------------------------------------- timing -- */
+#ifdef _WIN32
+static LARGE_INTEGER g_t0, g_freq;
+
+static void clock_init(void)
+{
+    QueryPerformanceFrequency(&g_freq);
+    QueryPerformanceCounter(&g_t0);
+}
 
 static double elapsed_ms(void)
 {
@@ -37,17 +67,41 @@ static double elapsed_ms(void)
     return (double)(now.QuadPart - g_t0.QuadPart) * 1000.0 / (double)g_freq.QuadPart;
 }
 
+static void sleep_ms(int ms) { Sleep((DWORD)ms); }
+#else
+static struct timespec g_t0;
+
+static void clock_init(void) { clock_gettime(CLOCK_MONOTONIC, &g_t0); }
+
+static double elapsed_ms(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (double)(now.tv_sec - g_t0.tv_sec) * 1000.0 +
+           (double)(now.tv_nsec - g_t0.tv_nsec) / 1e6;
+}
+
+static void sleep_ms(int ms)
+{
+    struct timespec ts = {ms / 1000, (long)(ms % 1000) * 1000000L};
+    nanosleep(&ts, NULL);
+}
+#endif
+
+/* --------------------------------------------------------------- workload -- */
+
 /* Dependent integer chain + independent FP chains: not trivially vectorizable,
  * keeps the core busy with real ALU/FPU work instead of memory traffic. */
 static void worker(intptr_t tid)
 {
+    slot_t *slot = &g_slots[tid];
     uint64_t x = 0x9E3779B97F4A7C15ULL * (uint64_t)(tid + 1) + 1;
     double a = 1.0 + (double)tid * 0.001;
     double b = 2.0;
     double c = 0.5;
     unsigned long long local = 0;
 
-    while (!g_stop) {
+    while (!atomic_load_explicit(&g_stop, memory_order_relaxed)) {
         for (int k = 0; k < g_inner; ++k) {
             x = x * 6364136223846793005ULL + 1442695040888963407ULL;
             uint64_t y = x ^ (x >> 29);
@@ -62,41 +116,77 @@ static void worker(intptr_t tid)
                 a += (double)(y & 0xFFFFFF);
         }
         local += (unsigned long long)g_inner;
-        atomic_fetch_add_explicit(&g_work, (unsigned long long)g_inner,
-                                  memory_order_relaxed);
+        /* single writer per slot: a relaxed store is enough */
+        atomic_store_explicit(&slot->work, local, memory_order_relaxed);
     }
 
-    /* keep the compiler from removing the chains */
-    g_sink += (uint64_t)(a + b + c) ^ x ^ local;
+    /* keep the compiler from removing the chains (read after join) */
+    slot->sink = (uint64_t)(a + b + c) ^ x ^ local;
 }
 
-static DWORD WINAPI worker_thread(LPVOID arg)
+static unsigned long long total_work(void)
+{
+    unsigned long long w = 0;
+    for (int i = 0; i < g_threads; ++i)
+        w += atomic_load_explicit(&g_slots[i].work, memory_order_relaxed);
+    return w;
+}
+
+static void monitor_loop(void)
+{
+    double next = 1000.0;
+    for (;;) {
+        double e = elapsed_ms();
+        while (e >= next) {
+            printf("TICK %.0f %llu\n", next, total_work());
+            fflush(stdout);
+            next += 1000.0;
+        }
+        if (e >= g_seconds * 1000.0) {
+            atomic_store(&g_stop, 1);
+            break;
+        }
+        sleep_ms(20);
+    }
+}
+
+/* ---------------------------------------------------------------- threads -- */
+#ifdef _WIN32
+typedef HANDLE thread_t;
+
+static DWORD WINAPI worker_entry(LPVOID arg)
 {
     worker((intptr_t)arg);
     return 0;
 }
 
-static DWORD WINAPI monitor(LPVOID arg)
+static int thread_start(thread_t *t, intptr_t tid)
 {
-    (void)arg;
-    double next = 1000.0;
-    for (;;) {
-        double e = elapsed_ms();
-        while (e >= next) {
-            unsigned long long w =
-                atomic_load_explicit(&g_work, memory_order_relaxed);
-            printf("TICK %.0f %llu\n", next, w);
-            fflush(stdout);
-            next += 1000.0;
-        }
-        if (e >= g_seconds * 1000.0) {
-            InterlockedExchange(&g_stop, 1);
-            break;
-        }
-        Sleep(20);
-    }
-    return 0;
+    *t = CreateThread(NULL, 0, worker_entry, (LPVOID)tid, 0, NULL);
+    return *t != NULL;
 }
+
+static void thread_join(thread_t t)
+{
+    WaitForSingleObject(t, INFINITE);
+    CloseHandle(t);
+}
+#else
+typedef pthread_t thread_t;
+
+static void *worker_entry(void *arg)
+{
+    worker((intptr_t)arg);
+    return NULL;
+}
+
+static int thread_start(thread_t *t, intptr_t tid)
+{
+    return pthread_create(t, NULL, worker_entry, (void *)tid) == 0;
+}
+
+static void thread_join(thread_t t) { pthread_join(t, NULL); }
+#endif
 
 int main(int argc, char **argv)
 {
@@ -108,40 +198,57 @@ int main(int argc, char **argv)
     if (argc > 3) g_inner = atoi(argv[3]);
     if (g_inner < 16) g_inner = 16;
 
-    QueryPerformanceFrequency(&g_freq);
-    QueryPerformanceCounter(&g_t0);
+    g_slots = (slot_t *)calloc((size_t)threads, sizeof(slot_t));
+    thread_t *th = (thread_t *)calloc((size_t)threads, sizeof(thread_t));
+    if (!g_slots || !th) {
+        fprintf(stderr, "out of memory\n");
+        return 1;
+    }
 
+    clock_init();
+
+#ifdef __VERSION__
+    printf("BUILD %s %s\n",
+#if defined(__clang__)
+           "clang",
+#elif defined(__GNUC__)
+           "gcc",
+#else
+           "cc",
+#endif
+           __VERSION__);
+#endif
     printf("THREADS %d\n", threads);
     printf("START\n");
     fflush(stdout);
 
-    HANDLE mon = CreateThread(NULL, 0, monitor, NULL, 0, NULL);
-
-    HANDLE *th = (HANDLE *)calloc((size_t)threads, sizeof(HANDLE));
-    if (!th) return 1;
+    int started = 0;
     for (int i = 0; i < threads; ++i) {
-        th[i] = CreateThread(NULL, 0, worker_thread, (LPVOID)(intptr_t)i, 0, NULL);
-        if (!th[i]) {
+        if (!thread_start(&th[i], (intptr_t)i)) {
             fprintf(stderr, "failed to create thread %d\n", i);
-            threads = i;
             break;
         }
+        started = i + 1;
     }
-    if (threads > 0)
-        WaitForMultipleObjects((DWORD)threads, th, TRUE, INFINITE);
-    for (int i = 0; i < threads; ++i)
-        CloseHandle(th[i]);
-    free(th);
+    g_threads = started;
 
-    InterlockedExchange(&g_stop, 1);
-    if (mon) {
-        WaitForSingleObject(mon, 5000);
-        CloseHandle(mon);
-    }
+    /* the main thread is the monitor: no extra thread competing with workers */
+    if (started > 0)
+        monitor_loop();
+    atomic_store(&g_stop, 1);
+
+    for (int i = 0; i < started; ++i)
+        thread_join(th[i]);
 
     double e = elapsed_ms();
-    unsigned long long w = atomic_load_explicit(&g_work, memory_order_relaxed);
+    unsigned long long w = total_work();
+    uint64_t sink = 0;
+    for (int i = 0; i < started; ++i)
+        sink ^= g_slots[i].sink;
     printf("DONE %.0f %llu\n", e, w);
     fflush(stdout);
-    return 0;
+    free(th);
+    free(g_slots);
+    g_sink = sink;
+    return started > 0 ? 0 : 1;
 }
