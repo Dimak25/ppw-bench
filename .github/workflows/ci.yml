@@ -58,7 +58,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.12"]
+        # 3.9 is not available on new Ubuntu runners; Windows still covers 3.9
+        python-version: ["3.10", "3.12"]
     steps:
       - uses: actions/checkout@v4
 

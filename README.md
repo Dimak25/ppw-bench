@@ -85,7 +85,7 @@ sudo python3 ppw_bench.py --quick   # bench соберётся через gcc с
 * `ppw-bench-vX.Y.Z-linux-x86_64.tar.gz` — скрипт + статический `bench`
   (~400 КБ). Нужен только `python3` ≥ 3.9, он есть почти в любом дистрибутиве.
 * `ppw-bench-vX.Y.Z-linux-x86_64` — самостоятельный бинарник (Nuitka), Python
-  не нужен (~11 МБ, glibc ≥ 2.35: Ubuntu 22.04+, Debian 12+, Fedora 36+).
+  не нужен (~4 МБ, glibc ≥ 2.35: Ubuntu 22.04+, Debian 12+, Fedora 36+).
 
 ```bash
 tar xzf ppw-bench-v*-linux-x86_64.tar.gz
