@@ -7,10 +7,10 @@ $ErrorActionPreference = "Stop"
 Set-Location -LiteralPath $PSScriptRoot
 
 if (-not $Version) {
-    $line = Select-String -Path "ppw_bench.py" -Pattern '^__version__ = "([^"]+)"' |
+    $line = Select-String -Path "ppwbench\__init__.py" -Pattern '^__version__ = "([^"]+)"' |
         Select-Object -First 1
     if (-not $line) {
-        throw "Cannot read __version__ from ppw_bench.py"
+        throw "Cannot read __version__ from ppwbench\__init__.py"
     }
     $Version = $line.Matches[0].Groups[1].Value
 }

@@ -1,7 +1,7 @@
 # PPW Bench — Performance per Watt
 
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
-[![Platform](https://img.shields.io/badge/platform-Windows-lightgrey)](#requirements)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey)](#requirements)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![CI](https://github.com/Dimak25/ppw-bench/actions/workflows/ci.yml/badge.svg)](https://github.com/Dimak25/ppw-bench/actions/workflows/ci.yml)
 
@@ -14,32 +14,46 @@ second for every watt it consumes.
 PPW = (work / second) / (average power, W)
 ```
 
-One script runs a deterministic C workload, samples real CPU power from Windows
-performance counters (RAPL) at the same time, and saves a `.txt` report. Built for
-the Intel Core Ultra 9 185H, but works on any Windows PC/laptop that exposes
-energy counters.
+One script runs a deterministic C workload, samples real CPU power (RAPL) at the
+same time, and saves a `.txt` report. Power comes from Windows performance
+counters or from Linux `powercap`. Built for the Intel Core Ultra 9 185H, but
+works on any Windows or Linux PC/laptop that exposes energy counters
+(Intel, AMD Zen).
 
 ## Features
 
-* C workload (Win32 threads): integer chains + floating point, identical work on
-  every machine, so scores are comparable across runs.
+* C workload (Win32 threads / pthreads): integer chains + floating point,
+  identical work on every machine, so scores are comparable across runs.
+  The compiler version is recorded in the report.
 * Multi-thread and single-thread phases.
-* Power: RAPL (CPU package and cores) with a system-wide `Power Meter` fallback.
+* Power: RAPL (CPU package and cores) with a system-wide fallback
+  (`Power Meter` on Windows, `psys` / battery on Linux). On Linux the energy
+  counter is used directly (ΔE/Δt), which is more accurate than averaging samples.
+* A cooldown between the multi-thread and single-thread phases.
 * Proper warm-up handling: the PL2 boost is skipped, the steady state is measured.
 * Stability indicator (power and speed spread) — you can see whether to trust the number.
-* Warnings: running on battery, "Power saver" plan, background CPU load.
-* `.txt` report (UTF-8 with BOM — opens correctly in Notepad).
+* Warnings: running on battery, power-saving plan/profile, background CPU load.
+* `.txt` report (on Windows UTF-8 with BOM — opens correctly in Notepad).
 * No external Python dependencies.
 
 ## Requirements
+
+### Windows
 
 * Windows 10/11.
 * Python 3.9+ (`py` or `python` in PATH).
 * **gcc** — MinGW-w64 or TDM-GCC (`gcc --version`).
   `bench.exe` is built automatically on the first run.
 
-For a fair measurement: AC power, "Balanced" or "High performance" power plan,
-other applications closed.
+### Linux
+
+* Any x86_64 distribution, kernel with `intel_rapl_common` (Intel, AMD Zen).
+* Python 3.9+ (`python3`) and `gcc` — or the ready-made release, see below.
+* RAPL access: since kernel 5.10 `energy_uj` is readable by root only, so run
+  with `sudo` or install the udev rule once (see [Linux](#linux)).
+
+For a fair measurement: AC power, "Balanced" or "High performance" power plan
+(on Linux: `powerprofilesctl set balanced`), other applications closed.
 
 ## Install
 
@@ -55,7 +69,50 @@ The build happens automatically. Manual build:
 gcc -O2 -static bench.c -o bench.exe
 ```
 
-## Portable build (no Python or gcc)
+## Linux
+
+From the repository:
+
+```bash
+git clone https://github.com/Dimak25/ppw-bench.git
+cd ppw-bench
+sudo python3 ppw_bench.py --quick   # bench is built with gcc automatically
+```
+
+Ready-made builds from [Releases](https://github.com/Dimak25/ppw-bench/releases/latest):
+
+* `ppw-bench-vX.Y.Z-linux-x86_64.tar.gz` — the script plus a static `bench`
+  (~400 KB). Needs only `python3` >= 3.9, which ships with almost every distro.
+* `ppw-bench-vX.Y.Z-linux-x86_64` — a standalone binary built with Nuitka, no
+  Python needed (~11 MB, glibc >= 2.35: Ubuntu 22.04+, Debian 12+, Fedora 36+).
+
+```bash
+tar xzf ppw-bench-v*-linux-x86_64.tar.gz
+cd ppw-bench-v*-linux-x86_64
+sudo ./ppw-bench --quick
+```
+
+```bash
+chmod +x ppw-bench-v*-linux-x86_64
+sudo ./ppw-bench-v*-linux-x86_64 --quick
+```
+
+When run with `sudo`, the report is handed back to your user, not root.
+
+### RAPL without sudo (udev)
+
+The rule gives read access to `energy_uj` to the `powercap` group only (not to
+everyone: the counters are restricted because of the Platypus side-channel
+attack, CVE-2020-8694), and the script adds you to that group:
+
+```bash
+sudo ./install-udev.sh        # in the repository: sudo packaging/linux/install-udev.sh
+```
+
+Then log out and back in (or run `newgrp powercap`). To remove it, run
+`sudo ./install-udev.sh --uninstall`.
+
+## Portable build for Windows (no Python or gcc)
 
 Ready-to-run builds are available on the
 [Releases](https://github.com/Dimak25/ppw-bench/releases/latest) page — Python
@@ -111,6 +168,7 @@ save the `.txt` report and keeps the window open.
 | `--threads N` | threads in the multi-thread phase (default: all) |
 | `--no-st` | multi-thread phase only |
 | `--only-st` | single-thread phase only |
+| `--cooldown N` | pause between phases in seconds (default 10, 0 = none) |
 | `--watts N` | use a fixed CPU wattage (no sensors available) |
 | `--out FILE` | report path (default `ppw-report-*.txt`) |
 | `--list` | list detected sensors and exit |
@@ -139,12 +197,13 @@ PHASE 1 — MULTI-THREAD (22 threads)
 
 ## How it works
 
-1. `ppw_bench.py` builds `bench.c` into `bench.exe` when needed.
+1. `ppw_bench.py` builds `bench.c` into `bench.exe` / `bench` when needed.
 2. It starts a phase; the C workload prints progress once per second.
-3. A background thread reads PDH counters:
-   * `\Energy Meter(*)\Power` — RAPL package/core power;
-   * `\Power Meter(*)\Power` — system power;
-   * `\Processor Information(_Total)\% Processor Performance` — auxiliary.
+3. A background thread reads power sensors:
+   * **Windows**, PDH counters: `\Energy Meter(*)\Power` (RAPL package/cores),
+     `\Power Meter(*)\Power` (system);
+   * **Linux**, `powercap`: `intel-rapl:N/energy_uj` (`package-N`), the `core`
+     subzone, `psys`; battery `power_now` as a fallback.
 4. The steady-state window after warm-up is selected; power and throughput are
    averaged over that same window.
 5. `PPW = work/s ÷ watts`; the report is written to `.txt`.
@@ -153,10 +212,20 @@ PHASE 1 — MULTI-THREAD (22 threads)
 
 ```
 ppw-bench/
-├── ppw_bench.py            # runner, power sampling, PPW, report
-├── bench.c                 # C workload (Win32 threads)
-├── run.bat                 # double-click launcher
-├── build-portable.ps1      # portable exe + ZIP build
+├── ppw_bench.py            # entry point
+├── ppwbench/
+│   ├── cli.py              # command line, menu
+│   ├── core.py             # bench build, phases, PPW
+│   ├── report.py           # report
+│   └── platforms/
+│       ├── windows.py      # PDH, registry, powercfg
+│       └── linux.py        # powercap, /proc, /sys
+├── bench.c                 # C workload (Win32 threads / pthreads)
+├── tests/                  # pytest
+├── run.bat                 # double-click launcher (Windows)
+├── build-portable.ps1      # Windows: portable exe + ZIP
+├── build-linux.sh          # Linux: tar.gz + Nuitka onefile
+├── packaging/linux/        # udev rule, install-udev.sh, launcher
 ├── README.md / README.en.md
 ├── LICENSE                 # MIT
 └── .github/workflows/
@@ -164,7 +233,7 @@ ppw-bench/
     └── release.yml         # publish the portable release on a tag
 ```
 
-`bench.exe` is a build artifact and is not committed (see `.gitignore`).
+`bench.exe` / `bench` are build artifacts and are not committed (see `.gitignore`).
 
 ## Troubleshooting
 
@@ -172,6 +241,9 @@ ppw-bench/
   missing. Use `--watts N` (CPU watts) or an external power meter.
 * Sensor present but PPW is empty — it returned 0; check `--list`.
 * `gcc not found` — install MinGW-w64/TDM-GCC or build `bench.exe` manually.
+* Linux: "RAPL found but not readable" — run with `sudo` or install the udev rule.
+* Linux: no `intel-rapl` zones — `sudo modprobe intel_rapl_common`. RAPL is
+  usually unavailable inside virtual machines.
 
 ## Tips for comparable results
 
@@ -183,8 +255,8 @@ ppw-bench/
 
 ## CI
 
-GitHub Actions on `windows-latest` builds `bench.c` with MinGW-w64 and runs a
-short smoke test. Power sensors are unavailable on CI runners, so PPW is n/a
+GitHub Actions on `windows-latest` and `ubuntu-latest` builds `bench.c`, runs
+the unit tests and a short smoke test. Power sensors are unavailable on CI runners, so PPW is n/a
 there — the pipeline only validates that everything runs.
 
 ## License

@@ -1,5 +1,6 @@
 # Сборка
 bench.exe
+/bench
 *.o
 *.obj
 build/
