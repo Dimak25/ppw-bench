@@ -84,7 +84,7 @@ Ready-made builds from [Releases](https://github.com/Dimak25/ppw-bench/releases/
 * `ppw-bench-vX.Y.Z-linux-x86_64.tar.gz` — the script plus a static `bench`
   (~400 KB). Needs only `python3` >= 3.9, which ships with almost every distro.
 * `ppw-bench-vX.Y.Z-linux-x86_64` — a standalone binary built with Nuitka, no
-  Python needed (~11 MB, glibc >= 2.35: Ubuntu 22.04+, Debian 12+, Fedora 36+).
+  Python needed (~4 MB, glibc >= 2.35: Ubuntu 22.04+, Debian 12+, Fedora 36+).
 
 ```bash
 tar xzf ppw-bench-v*-linux-x86_64.tar.gz
