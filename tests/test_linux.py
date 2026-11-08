@@ -105,3 +105,44 @@ def test_amd_core_zone_is_hidden(sysfs):
     groups = linux.discover_zones()
     assert len(groups["pkg"]) == 1
     assert groups["pp0"] == []
+
+
+def test_core_types_intel_hybrid_pmu(sysfs):
+    (sysfs / "devices/cpu_core").mkdir(parents=True)
+    (sysfs / "devices/cpu_atom").mkdir(parents=True)
+    (sysfs / "devices/cpu_core/cpus").write_text("0-11\n")
+    (sysfs / "devices/cpu_atom/cpus").write_text("12-21\n")
+    assert linux.core_types() == {"p": list(range(12)), "e": list(range(12, 22))}
+
+
+def _freq(sysfs, cpu, khz):
+    d = sysfs / f"devices/system/cpu/cpu{cpu}/cpufreq"
+    d.mkdir(parents=True)
+    (d / "cpuinfo_max_freq").write_text(f"{khz}\n")
+
+
+def test_core_types_by_frequency(sysfs):
+    # Zen 5 + Zen 5c: 5.1 и 3.3 ГГц
+    for c in range(4):
+        _freq(sysfs, c, 5_100_000)
+    for c in range(4, 12):
+        _freq(sysfs, c, 3_300_000)
+    assert linux.core_types() == {"p": [0, 1, 2, 3], "e": list(range(4, 12))}
+
+
+def test_preferred_cores_are_not_hybrid(sysfs):
+    # amd-pstate preferred cores: частоты различаются на несколько процентов
+    for c, f in enumerate([4_550_000, 4_550_000, 4_400_000, 4_300_000]):
+        _freq(sysfs, c, f)
+    assert linux.core_types() is None
+
+
+def test_pinned_restores_affinity():
+    before = os.sched_getaffinity(0)
+    target = [min(before)]
+    with linux.pinned(target) as applied:
+        assert applied == target
+        assert os.sched_getaffinity(0) == set(target)
+    assert os.sched_getaffinity(0) == before
+    with linux.pinned([10_000]) as applied:  # нет такого CPU — без закрепления
+        assert applied is None

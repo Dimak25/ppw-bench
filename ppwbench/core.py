@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import shutil
+import statistics
 import subprocess
 import threading
 import time
@@ -185,14 +187,18 @@ def window_power(window: list[dict], key: str) -> float | None:
     return sum(vals) / len(vals) if vals else None
 
 
-def run_phase(exe: Path, threads: int, duration: float, sampler: Sampler) -> dict:
-    proc = subprocess.Popen(
-        [str(exe), str(threads), f"{duration:.3f}"],
-        stdout=subprocess.PIPE,
-        # stderr никто не читает: PIPE мог бы переполниться и подвесить bench
-        stderr=subprocess.DEVNULL,
-        bufsize=0,
-    )
+def run_phase(exe: Path, threads: int, duration: float, sampler: Sampler,
+              backend=None, cpus: list[int] | None = None) -> dict:
+    """Один прогон bench. cpus — ограничить bench этими логическими CPU."""
+    pin_ctx = backend.pinned(cpus) if (backend is not None and cpus) else contextlib.nullcontext()
+    with pin_ctx as applied:
+        proc = subprocess.Popen(
+            [str(exe), str(threads), f"{duration:.3f}"],
+            stdout=subprocess.PIPE,
+            # stderr никто не читает: PIPE мог бы переполниться и подвесить bench
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+        )
     assert proc.stdout is not None
 
     t_start = None
@@ -284,6 +290,7 @@ def run_phase(exe: Path, threads: int, duration: float, sampler: Sampler) -> dic
         "ppw": None,
         "energy_j": None,
         "samples": len(window),
+        "cpus": applied,
         "time_s": datetime.now(),
     }
 
@@ -313,6 +320,49 @@ def apply_power_basis(res: dict, manual: float | None) -> dict:
     res["ppw"] = res["work_per_s"] / power if power else None
     res["energy_j"] = power * res["steady"] if power else None
     return res
+
+
+MEDIAN_KEYS = (
+    "steady", "total_work", "work_per_s", "pkg_w", "pp0_w", "sys_w", "pkg_cv",
+    "rate_cv", "ppw_pkg", "ppw_sys", "power_w", "ppw", "energy_j", "samples",
+)
+
+
+def _median(vals: list) -> float | None:
+    vals = [v for v in vals if v is not None]
+    return statistics.median(vals) if vals else None
+
+
+def aggregate_runs(runs: list[dict]) -> dict:
+    """Сводит повторы одной фазы: медианы показателей + разброс между прогонами.
+
+    Медиана устойчива к одному неудачному прогону (фоновая задача, троттлинг),
+    а разброс между прогонами показывает, насколько можно доверять разнице
+    между машинами."""
+    if len(runs) == 1:
+        res = dict(runs[0])
+        res["repeat"] = 1
+        return res
+    res = dict(runs[0])
+    for key in MEDIAN_KEYS:
+        res[key] = _median([r.get(key) for r in runs])
+    if res.get("samples") is not None:
+        res["samples"] = int(res["samples"])
+    metric = "ppw" if all(r.get("ppw") for r in runs) else "work_per_s"
+    vals = [r[metric] for r in runs]
+    res["repeat"] = len(runs)
+    res["runs_metric"] = metric
+    res["runs_values"] = vals
+    res["runs_cv"] = coeff_var(vals) if len(vals) >= 3 else _spread_pct(vals)
+    return res
+
+
+def _spread_pct(vals: list[float]) -> float | None:
+    """Для двух прогонов CV не информативен — берём половину размаха, %."""
+    m = sum(vals) / len(vals)
+    if m <= 0:
+        return None
+    return (max(vals) - min(vals)) / 2 / m * 100.0
 
 
 def cooldown(seconds: float) -> None:
