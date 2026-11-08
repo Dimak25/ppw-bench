@@ -146,3 +146,36 @@ def test_pinned_restores_affinity():
     assert os.sched_getaffinity(0) == before
     with linux.pinned([10_000]) as applied:  # нет такого CPU — без закрепления
         assert applied is None
+
+
+def _cache(sysfs, cpu, level, shared):
+    d = sysfs / f"devices/system/cpu/cpu{cpu}/cache/index{level}"
+    d.mkdir(parents=True)
+    (d / "level").write_text(f"{level}\n")
+    (d / "type").write_text("Unified\n")
+    (d / "shared_cpu_list").write_text(shared + "\n")
+
+
+def test_core_types_meteor_lake_lpe_without_l3(sysfs):
+    # Linux-нумерация 185H: P 0-11, E 12-19, LP-E 20-21; у LP-E нет L3
+    (sysfs / "devices/cpu_core").mkdir(parents=True)
+    (sysfs / "devices/cpu_atom").mkdir(parents=True)
+    (sysfs / "devices/cpu_core/cpus").write_text("0-11\n")
+    (sysfs / "devices/cpu_atom/cpus").write_text("12-21\n")
+    for c in range(20):
+        _cache(sysfs, c, 2, str(c))
+        _cache(sysfs, c, 3, "0-19")
+    for c in (20, 21):
+        _cache(sysfs, c, 2, "20-21")
+    assert linux.core_types() == {"p": list(range(12)), "e": list(range(12, 20)),
+                                  "lpe": [20, 21]}
+
+
+def test_core_types_zen5c_with_own_l3_is_not_lpe(sysfs):
+    for c in range(4):
+        _freq(sysfs, c, 5_100_000)
+        _cache(sysfs, c, 3, "0-3")
+    for c in range(4, 12):
+        _freq(sysfs, c, 3_300_000)
+        _cache(sysfs, c, 3, "4-11")
+    assert linux.core_types() == {"p": [0, 1, 2, 3], "e": list(range(4, 12))}

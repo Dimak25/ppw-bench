@@ -14,7 +14,7 @@ import time
 import winreg
 from ctypes import wintypes
 
-from ppwbench.cpusets import parse_cpu_set_information, split_by_class
+from ppwbench.cpusets import parse_cpu_set_information, windows_tiers
 
 NAME = "Windows"
 CREATE_NO_WINDOW = 0x08000000
@@ -70,11 +70,25 @@ def logical_cpus() -> int:
     return os.cpu_count() or 1
 
 
+def _cpu_vendor() -> str:
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+        )
+        val, _ = winreg.QueryValueEx(key, "VendorIdentifier")
+        return str(val)
+    except Exception:
+        return ""
+
+
 def core_types() -> dict[str, list[int]] | None:
     """Типы ядер гибридного CPU по EfficiencyClass (GetSystemCpuSetInformation).
 
-    Чем выше класс, тем производительнее ядро: P-ядра — наибольший класс,
-    E и LP-E — остальные. На обычных CPU класс у всех ядер 0 -> None."""
+    Чем выше класс, тем производительнее ядро: P-ядра — наибольший класс.
+    E и LP-E у Meteor Lake часто в одном классе — их различаем по кэшу
+    последнего уровня (у LP-E свой, на SoC-кристалле). На обычных CPU класс
+    у всех ядер 0 -> None."""
     try:
         k32 = ctypes.windll.kernel32
         fn = k32.GetSystemCpuSetInformation
@@ -88,7 +102,8 @@ def core_types() -> dict[str, list[int]] | None:
         buf = ctypes.create_string_buffer(length.value)
         if not fn(buf, length, ctypes.byref(length), None, 0):
             return None
-        return split_by_class(parse_cpu_set_information(buf.raw[: length.value]))
+        info = parse_cpu_set_information(buf.raw[: length.value])
+        return windows_tiers(info, intel="GenuineIntel" in _cpu_vendor())
     except Exception:
         return None
 

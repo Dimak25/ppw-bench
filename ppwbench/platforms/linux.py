@@ -20,7 +20,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from ppwbench.cpusets import parse_cpulist, split_by_class
+from ppwbench.cpusets import classify_tiers, parse_cpulist
 
 NAME = "Linux"
 
@@ -95,10 +95,41 @@ def logical_cpus() -> int:
         return os.cpu_count() or 1
 
 
-def core_types() -> dict[str, list[int]] | None:
-    """Типы ядер гибридного CPU: {"p": [...], "e": [...]} или None.
+def _llc_level(cpu: int) -> int | None:
+    """Уровень кэша последнего уровня у CPU (3 = L3, 2 = только L2)."""
+    best = None
+    for idx in (SYSFS / f"devices/system/cpu/cpu{cpu}/cache").glob("index[0-9]*"):
+        if _read(idx / "type") == "Instruction":
+            continue
+        lvl = _read_int(idx / "level")
+        if lvl is not None and (best is None or lvl > best):
+            best = lvl
+    return best
 
-    Intel (Alder Lake и новее): PMU cpu_core / cpu_atom в /sys/devices.
+
+def _lpe_candidates(classes: dict[int, float]) -> set[int]:
+    """«Не-P» ядра с кэшем последнего уровня ниже, чем у P-ядер.
+
+    У Meteor Lake LP-E-ядра на SoC-кристалле и не видят L3 (только L2),
+    хотя PMU у них общий с E-ядрами (cpu_atom). У AMD Zen 5c L3 есть,
+    поэтому они в кандидаты не попадают."""
+    if not classes:
+        return set()
+    top = max(classes.values())
+    levels = {c: _llc_level(c) for c in classes}
+    p_levels = {lv for c, lv in levels.items() if classes[c] == top and lv is not None}
+    if not p_levels:
+        return set()
+    p_max = max(p_levels)
+    return {c for c, lv in levels.items()
+            if classes[c] != top and lv is not None and lv < p_max}
+
+
+def core_types() -> dict[str, list[int]] | None:
+    """Типы ядер гибридного CPU: {"p": [...], "e": [...], ["lpe": [...]]} или None.
+
+    Intel (Alder Lake и новее): PMU cpu_core / cpu_atom в /sys/devices;
+    LP-E (Meteor Lake) выделяются из cpu_atom по отсутствию L3.
     Иначе (например, AMD Zen 5 + Zen 5c) — по максимальной частоте ядер:
     гибридным считаем CPU, где медленные ядра уступают быстрым больше 13 %.
     Небольшие различия (preferred cores у amd-pstate) гибридом не считаются."""
@@ -110,7 +141,9 @@ def core_types() -> dict[str, list[int]] | None:
         except ValueError:
             p, e = [], []
         if p and e:
-            return {"p": p, "e": e}
+            classes = {c: 1.0 for c in p}
+            classes.update({c: 0.0 for c in e})
+            return classify_tiers(classes, _lpe_candidates(classes))
 
     freqs: dict[int, float] = {}
     for d in (SYSFS / "devices/system/cpu").glob("cpu[0-9]*"):
@@ -122,7 +155,8 @@ def core_types() -> dict[str, list[int]] | None:
     top = max(freqs.values())
     if min(freqs.values()) / top > 0.87:
         return None
-    return split_by_class({c: (1.0 if f >= 0.9 * top else 0.0) for c, f in freqs.items()})
+    classes = {c: (1.0 if f >= 0.9 * top else 0.0) for c, f in freqs.items()}
+    return classify_tiers(classes, _lpe_candidates(classes))
 
 
 @contextlib.contextmanager
