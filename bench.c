@@ -13,11 +13,16 @@
  *   START
  *   TICK <elapsed_ms> <total_work_units>      (once per second)
  *   ...
+ *   STOP <elapsed_ms> <total_work_units>      (workload ends)
+ *   FREQ <thread> <cpu> <mhz>                 (one per thread, see probe)
  *   DONE <elapsed_ms> <total_work_units>
  *
  * 1 work unit = one fixed inner-loop block (INNER), identical for every thread
  * and every machine, so the score is "work units per second".
  */
+#if !defined(_WIN32) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE /* sched_getcpu; must precede every system header */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -27,6 +32,7 @@
 #include <windows.h>
 #else
 #include <pthread.h>
+#include <sched.h>
 #include <time.h>
 #endif
 
@@ -40,7 +46,9 @@
 typedef struct {
     _Atomic unsigned long long work;
     uint64_t sink;
-    char pad[64 - sizeof(unsigned long long) - sizeof(uint64_t)];
+    double probe_mhz; /* measured core clock right after the workload */
+    int probe_cpu;    /* logical CPU the probe ran on, -1 if unknown */
+    char pad[64 - sizeof(unsigned long long) - sizeof(uint64_t) - sizeof(double) - sizeof(int)];
 } slot_t;
 
 static slot_t *g_slots = NULL;
@@ -88,6 +96,60 @@ static void sleep_ms(int ms)
 }
 #endif
 
+/* ------------------------------------------------------------ clock probe -- */
+
+#ifndef PROBE_MS
+#define PROBE_MS 250
+#endif
+
+static int current_cpu(void)
+{
+#ifdef _WIN32
+    return (int)GetCurrentProcessorNumber();
+#else
+    return sched_getcpu();
+#endif
+}
+
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__) || defined(__aarch64__))
+#define HAVE_PROBE 1
+/* 100 dependent register+register adds: exactly 100 core clock cycles on any
+ * modern x86/ARM core. Register+register on purpose: recent Intel P-cores
+ * can fold add-with-immediate chains at rename, which would read too high.
+ * The loop counter runs in parallel and adds nothing to the chain. */
+static uint64_t add_chain(uint64_t blocks, uint64_t one)
+{
+    uint64_t x = 0;
+    for (uint64_t i = 0; i < blocks; ++i) {
+#if defined(__aarch64__)
+        __asm__ volatile(".rept 100\n\tadd %0, %0, %1\n\t.endr" : "+r"(x) : "r"(one));
+#else
+        __asm__ volatile(".rept 100\n\tadd %1, %0\n\t.endr" : "+r"(x) : "r"(one));
+#endif
+    }
+    return x;
+}
+
+/* Effective clock of the core this thread runs on, in MHz. Runs right after
+ * the workload, without idling, so the core is still in the same state.
+ * Independent of OS counters (which are unreliable on hybrid CPUs). */
+static double probe_mhz(uint64_t one)
+{
+    const uint64_t chunk = 2000; /* 200k cycles per time check */
+    uint64_t blocks = 0;
+    volatile uint64_t sink = 0;
+    sink += add_chain(chunk, one); /* warm-up */
+    double t0 = elapsed_ms(), t;
+    do {
+        sink += add_chain(chunk, one);
+        blocks += chunk;
+        t = elapsed_ms();
+    } while (t - t0 < PROBE_MS);
+    (void)sink;
+    return (double)blocks * 100.0 / ((t - t0) * 1000.0); /* cycles/us = MHz */
+}
+#endif
+
 /* --------------------------------------------------------------- workload -- */
 
 /* Dependent integer chain + independent FP chains: not trivially vectorizable,
@@ -122,6 +184,12 @@ static void worker(intptr_t tid)
 
     /* keep the compiler from removing the chains (read after join) */
     slot->sink = (uint64_t)(a + b + c) ^ x ^ local;
+
+    slot->probe_cpu = -1;
+#ifdef HAVE_PROBE
+    slot->probe_mhz = probe_mhz((uint64_t)(tid >= 0) | 1u);
+#endif
+    slot->probe_cpu = current_cpu();
 }
 
 static unsigned long long total_work(void)
@@ -144,6 +212,8 @@ static void monitor_loop(void)
         }
         if (e >= g_seconds * 1000.0) {
             atomic_store(&g_stop, 1);
+            printf("STOP %.0f %llu\n", elapsed_ms(), total_work());
+            fflush(stdout);
             break;
         }
         sleep_ms(20);
@@ -245,6 +315,9 @@ int main(int argc, char **argv)
     uint64_t sink = 0;
     for (int i = 0; i < started; ++i)
         sink ^= g_slots[i].sink;
+    for (int i = 0; i < started; ++i)
+        if (g_slots[i].probe_mhz > 0)
+            printf("FREQ %d %d %.0f\n", i, g_slots[i].probe_cpu, g_slots[i].probe_mhz);
     printf("DONE %.0f %llu\n", e, w);
     fflush(stdout);
     free(th);

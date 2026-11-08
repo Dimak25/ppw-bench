@@ -229,13 +229,13 @@ PHASE 1 — MULTI-THREAD (22 threads)
   computation in `bench.c`, so results are comparable between machines and runs.
 * **PPW (package)** — the main result: work/s per watt of CPU package power.
 * **PPW (system)** — the same for whole-system power (on battery).
-* **Core frequency** ("Частота ядра / ядер") — effective frequency of the
-  cores the phase ran on: the busiest core (and its number) in the
-  single-thread phase; the average over busy cores in the multi-thread phase,
-  split into P / E / LP-E on hybrid CPUs. Windows: `% Processor Performance` ×
-  `Processor Frequency` (like Task Manager's "Speed"); Linux:
-  `scaling_cur_freq` (or `cpu MHz` from `/proc/cpuinfo`). Shows whether the
-  power plan keeps cores at a low clock.
+* **Core frequency** ("Частота ядра / ядер") — the real core clock under
+  load. At the end of each phase, without letting the cores idle, bench runs
+  a chain of dependent adds (exactly 1 cycle each) for ~0.25 s, so adds per
+  second is the clock. OS counters are not used: on hybrid CPUs Windows reports
+  values that are clearly too low. Single-thread phases show the clock and the
+  CPU number; multi-thread phases show the average, split into P / E / LP-E on
+  hybrid CPUs. Shows whether the power plan keeps cores at a low clock.
 * **Stability** — spread inside the measurement window. Above ~10–15 % the run
   is noisy (battery, power saving, background tasks).
 

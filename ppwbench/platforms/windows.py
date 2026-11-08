@@ -14,7 +14,7 @@ import time
 import winreg
 from ctypes import wintypes
 
-from ppwbench.cpusets import parse_cpu_set_information, pdh_cpu_index, windows_tiers
+from ppwbench.cpusets import parse_cpu_set_information, windows_tiers
 
 NAME = "Windows"
 CREATE_NO_WINDOW = 0x08000000
@@ -459,53 +459,3 @@ class PowerReader:
             ]
         return []
 
-
-# --------------------------------------------------------------------------
-#  Частоты ядер
-# --------------------------------------------------------------------------
-
-FREQ_COUNTERS = {
-    "perf": r"\Processor Information(*)\% Processor Performance",
-    "base": r"\Processor Information(*)\Processor Frequency",
-    "time": r"\Processor Information(*)\% Processor Time",
-}
-
-
-class FreqReader:
-    """Эффективная частота и загрузка каждого логического CPU (PDH).
-
-    Частота = Processor Frequency (номинальная, МГц) x % Processor Performance
-    / 100 — так же «Скорость» считает Диспетчер задач. % Processor Performance
-    берётся по APERF/MPERF, то есть отражает реальную частоту, пока ядро
-    работает, и с турбобустом может быть больше 100 %."""
-
-    source = "PDH"
-
-    def __init__(self) -> None:
-        self.query = PDH_HQUERY()
-        self.handles: dict[str, PDH_HCOUNTER] = {}
-        if pdh.PdhOpenQueryW(None, 0, ctypes.byref(self.query)) != 0:
-            return
-        for key, path in FREQ_COUNTERS.items():
-            h = PDH_HCOUNTER()
-            if pdh.PdhAddEnglishCounterW(self.query, path, 0, ctypes.byref(h)) == 0:
-                self.handles[key] = h
-        if "perf" in self.handles or "base" in self.handles:
-            pdh.PdhCollectQueryData(self.query)  # rate-счётчикам нужен первый сбор
-
-    def read(self) -> dict[int, tuple[float, float | None]]:
-        if not self.handles:
-            return {}
-        pdh.PdhCollectQueryData(self.query)
-        perf = _read_array(self.handles.get("perf"))
-        base = _read_array(self.handles.get("base"))
-        busy = _read_array(self.handles.get("time"))
-        out: dict[int, tuple[float, float | None]] = {}
-        for name, mhz in base.items():
-            c = pdh_cpu_index(name)
-            if c is None or mhz <= 0:
-                continue
-            pct = perf.get(name)
-            eff = mhz * pct / 100.0 if pct and pct > 0 else mhz
-            out[c] = (eff, busy.get(name))
-        return out
