@@ -65,6 +65,14 @@ def cpu_name() -> str:
     return platform.processor() or platform.machine() or "unknown CPU"
 
 
+def cpu_vendor() -> str:
+    for line in (_read(PROCFS / "cpuinfo") or "").splitlines():
+        name, sep, value = line.partition(":")
+        if sep and name.strip() == "vendor_id":
+            return value.strip()
+    return ""
+
+
 def physical_cores() -> int | None:
     """Уникальные пары (package, core) из /sys/devices/system/cpu/*/topology."""
     cores = set()
@@ -276,8 +284,14 @@ def discover_zones() -> dict[str, list[EnergyCounter]]:
     """pkg — пакеты (по сокетам), pp0 — ядра, psys — вся платформа.
 
     intel-rapl-mmio:* дублирует package-0 на части Intel — пропускаем,
-    иначе мощность посчитается дважды. Тот же драйвер работает на AMD Zen."""
+    иначе мощность посчитается дважды. Тот же драйвер работает на AMD Zen.
+
+    На AMD зона core берётся из MSR_AMD_CORE_ENERGY_STATUS, который считает
+    энергию одного ядра (того, где ядро ОС его читает), а не всех ядер:
+    получается ~1/N мощности ядер в MT и почти 0 Вт в ST. Такую зону не
+    показываем, чтобы не вводить в заблуждение."""
     groups: dict[str, list[EnergyCounter]] = {"pkg": [], "pp0": [], "psys": []}
+    per_core_only = cpu_vendor() in ("AuthenticAMD", "HygonGenuine")
     base = SYSFS / "class/powercap"
     for zone in sorted(base.glob("intel-rapl:*")):
         if not (zone / "energy_uj").exists():
@@ -286,7 +300,7 @@ def discover_zones() -> dict[str, list[EnergyCounter]]:
         top_level = zone.name.count(":") == 1
         if top_level and name.startswith("package"):
             groups["pkg"].append(EnergyCounter(zone))
-        elif not top_level and name == "core":
+        elif not top_level and name == "core" and not per_core_only:
             groups["pp0"].append(EnergyCounter(zone))
         elif name == "psys":
             groups["psys"].append(EnergyCounter(zone))

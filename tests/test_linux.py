@@ -95,3 +95,13 @@ def test_cpu_info(sysfs):
         (t / "core_id").write_text(f"{core}\n")
     assert linux.cpu_name() == "Test CPU 9000"
     assert linux.physical_cores() == 2
+
+
+def test_amd_core_zone_is_hidden(sysfs):
+    (sysfs / "proc").mkdir()
+    (sysfs / "proc/cpuinfo").write_text("vendor_id\t: AuthenticAMD\n")
+    _zone(sysfs, "intel-rapl:0", "package-0", 0)
+    _zone(sysfs, "intel-rapl:0:0", "core", 0)
+    groups = linux.discover_zones()
+    assert len(groups["pkg"]) == 1
+    assert groups["pp0"] == []

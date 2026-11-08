@@ -157,6 +157,19 @@ def coeff_var(vals: list[float]) -> float | None:
     return (var ** 0.5) / m * 100.0
 
 
+def per_second(window: list[dict], key: str, t0: float) -> list[float]:
+    """Средние значения по секундным интервалам окна.
+
+    Разброс считается по секундам, как и для скорости: отдельные замеры
+    раз в 0,2 с ловят мгновенные всплески (фоновые задачи, переходы
+    между ядрами) и завышают «нестабильность», особенно в ST-фазе."""
+    buckets: dict[int, list[float]] = {}
+    for s in window:
+        if s.get(key) is not None:
+            buckets.setdefault(int(s["t"] - t0), []).append(s[key])
+    return [sum(v) / len(v) for _, v in sorted(buckets.items())]
+
+
 def window_power(window: list[dict], key: str) -> float | None:
     """Средняя мощность в окне.
 
@@ -261,7 +274,7 @@ def run_phase(exe: Path, threads: int, duration: float, sampler: Sampler) -> dic
         "pkg_w": pkg,
         "pp0_w": pp0,
         "sys_w": sysw,
-        "pkg_cv": coeff_var([s["pkg"] for s in window if s.get("pkg") is not None]),
+        "pkg_cv": coeff_var(per_second(window, "pkg", w_start)),
         "rate_cv": coeff_var(rates),
         "ppw_pkg": work_per_s / pkg if pkg else None,
         "ppw_sys": work_per_s / sysw if sysw else None,
