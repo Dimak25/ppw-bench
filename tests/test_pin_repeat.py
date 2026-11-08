@@ -13,23 +13,51 @@ def test_cpulist_roundtrip():
         cpusets.parse_cpulist("5-2")
 
 
-def test_windows_cpu_sets_meteor_lake_like():
-    # 185H: P-ядра класс 2 (с HT), E — 1, LP-E — 0; плюс запись из группы 1
-    raw = b"".join(
-        [cpusets.build_cpu_set_entry(i, 2) for i in range(12)]
-        + [cpusets.build_cpu_set_entry(i, 1) for i in range(12, 20)]
-        + [cpusets.build_cpu_set_entry(i, 0) for i in range(20, 22)]
-        + [cpusets.build_cpu_set_entry(0, 2, group=1)]
-    )
-    classes = cpusets.parse_cpu_set_information(raw)
-    assert len(classes) == 22
-    types = cpusets.split_by_class(classes)
-    assert types == {"p": list(range(12)), "e": list(range(12, 22))}
+def _mtl_raw(eff_e: int, eff_lpe: int) -> bytes:
+    """Раскладка 185H, как её нумерует Windows: P 0-1,10-19; E 2-9; LP-E 20-21.
+    У LP-E свой кэш последнего уровня (LLC 1), у P и E общий L3 (LLC 0)."""
+    p = [0, 1] + list(range(10, 20))
+    entries = [cpusets.build_cpu_set_entry(i, 2 if eff_e < 2 else 3, llc=0) for i in p]
+    entries += [cpusets.build_cpu_set_entry(i, eff_e, llc=0) for i in range(2, 10)]
+    entries += [cpusets.build_cpu_set_entry(i, eff_lpe, llc=1) for i in (20, 21)]
+    entries += [cpusets.build_cpu_set_entry(0, 2, group=1)]  # группа 1 игнорируется
+    return b"".join(entries)
+
+
+MTL = {"p": [0, 1] + list(range(10, 20)), "e": list(range(2, 10)), "lpe": [20, 21]}
+
+
+def test_windows_meteor_lake_e_and_lpe_share_class():
+    # E и LP-E в одном классе — различаем по кэшу последнего уровня
+    info = cpusets.parse_cpu_set_information(_mtl_raw(eff_e=1, eff_lpe=1))
+    assert len(info) == 22
+    assert cpusets.windows_tiers(info, intel=True) == MTL
+
+
+def test_windows_three_efficiency_classes():
+    info = cpusets.parse_cpu_set_information(_mtl_raw(eff_e=1, eff_lpe=0))
+    assert cpusets.windows_tiers(info, intel=True) == MTL
+
+
+def test_windows_amd_separate_l3_is_not_lpe():
+    # Zen 5 + Zen 5c: у компактных ядер свой L3, но это не LP-E
+    raw = b"".join([cpusets.build_cpu_set_entry(i, 1, llc=0) for i in range(8)]
+                   + [cpusets.build_cpu_set_entry(i, 0, llc=1) for i in range(8, 24)])
+    info = cpusets.parse_cpu_set_information(raw)
+    assert cpusets.windows_tiers(info, intel=False) == {"p": list(range(8)),
+                                                        "e": list(range(8, 24))}
+
+
+def test_lunar_lake_like_only_lpe_is_reported_as_e():
+    # все «не-P» ядра без общего L3 — не делим, это просто E
+    tiers = cpusets.classify_tiers({0: 1, 1: 1, 2: 0, 3: 0}, lpe_candidates={2, 3})
+    assert tiers == {"p": [0, 1], "e": [2, 3]}
 
 
 def test_non_hybrid_has_no_types():
     raw = b"".join(cpusets.build_cpu_set_entry(i, 0) for i in range(8))
-    assert cpusets.split_by_class(cpusets.parse_cpu_set_information(raw)) is None
+    info = cpusets.parse_cpu_set_information(raw)
+    assert cpusets.windows_tiers(info, intel=True) is None
 
 
 class FakeBackend:
@@ -54,8 +82,31 @@ def test_resolve_pin_modes():
     assert cpus is None and warns
 
 
+def test_resolve_st_all_tiers():
+    phases, warns = cli.resolve_st("all", FakeBackend(MTL))
+    assert not warns
+    assert [p["tag"] for p in phases] == ["ST-P", "ST-E", "ST-LP-E"]
+    assert [p["core_kind"] for p in phases] == ["P", "E", "LP-E"]
+    assert phases[2]["cpus"] == [20, 21]
+    assert phases[2]["label"] == "LP-E-ядра (CPU 20-21)"
+
+    # без LP-E (Alder Lake): только P и E
+    phases, _ = cli.resolve_st("all", FakeBackend({"p": [0, 1], "e": [2, 3]}))
+    assert [p["tag"] for p in phases] == ["ST-P", "ST-E"]
+
+
+def test_resolve_st_lpe_missing_warns():
+    phases, warns = cli.resolve_st("lpe", FakeBackend({"p": [0, 1], "e": [2, 3]}))
+    assert phases[0]["cpus"] is None
+    assert warns and "LP-E" in warns[0] and "есть: P, E" in warns[0]
+    phases, warns = cli.resolve_st("lpe", FakeBackend(MTL))
+    assert phases[0]["cpus"] == [20, 21] and not warns
+
+
 def test_pin_arg_validation():
     assert cli.pin_arg("P") == "p"
+    assert cli.pin_arg("LPE") == "lpe"
+    assert cli.pin_arg("all") == "all"
     assert cli.pin_arg("0-3") == "0-3"
     with pytest.raises(argparse.ArgumentTypeError):
         cli.pin_arg("fast")
@@ -90,3 +141,13 @@ def test_report_shows_repeats_and_cores():
     assert "Повторов          : 3" in text
     assert "Повторы (3)         : PPW 30.0 / 31.0 / 32.0 Mед/с на Вт, разброс" in text
     assert "Ядра                : P-ядра (CPU 0-1)" in text
+
+
+def test_report_titles_core_kind():
+    st = dict(_run(30e6, 3e8), core_kind="LP-E", pin_label="LP-E-ядра (CPU 20-21)")
+    agg = core.aggregate_runs([st])
+    meta = dict(date="d", cpu="c", cores=4, threads=8, os="o", power="p",
+                duration=20, warmup=8, warnings=[])
+    text = build_report(meta, [agg], "src")
+    assert "ФАЗА 1 — SINGLE-THREAD, LP-E-ядро (1 поток(ов))" in text
+    assert "  ST (LP-E): 30.000 Mед/с на Вт" in text

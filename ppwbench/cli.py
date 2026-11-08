@@ -16,7 +16,7 @@ import platform
 from datetime import datetime
 
 from ppwbench import __version__, core, report, util
-from ppwbench.cpusets import format_cpulist, parse_cpulist
+from ppwbench.cpusets import TIER_NAMES, TIER_ORDER, format_cpulist, parse_cpulist
 from ppwbench.platforms import current as current_backend
 from ppwbench.util import fmt_si
 
@@ -32,9 +32,13 @@ def print_sensors(reader) -> None:
         print(f"   ! {hint}")
 
 
-def interactive_menu(reader) -> float | None:
-    """Спрашивает режим теста. Возвращает длительность фазы или None (выход)."""
+def interactive_menu(reader, hybrid: bool) -> tuple[float, str | None] | None:
+    """Спрашивает режим теста.
+
+    Возвращает (длительность фазы, режим --pin или None) либо None (выход).
+    На гибридных CPU есть пункт «ST на каждом типе ядер»."""
     durations = {"2": 20.0, "3": 60.0, "4": 120.0}
+    choices = {"0", "1", "2", "3", "4"} | ({"5"} if hybrid else set())
     print(f"PPW Bench {__version__} — интерактивный режим")
     print()
     while True:
@@ -43,8 +47,10 @@ def interactive_menu(reader) -> float | None:
         print("  2. Быстрый тест      — 20 с на фазу")
         print("  3. Обычный тест      — 60 с на фазу")
         print("  4. Длительный тест   — 120 с на фазу")
+        if hybrid:
+            print("  5. Один поток на каждом типе ядер (P / E / LP-E) — по 30 с")
         print("  0. Выход")
-        choice = util.ask_choice("Выбор [3]: ", {"0", "1", "2", "3", "4"}, "3")
+        choice = util.ask_choice("Выбор [3]: ", choices, "3")
         print()
         if choice == "0":
             return None
@@ -54,10 +60,12 @@ def interactive_menu(reader) -> float | None:
             util.pause("Нажмите Enter, чтобы вернуться в меню...")
             print()
             continue
-        return durations[choice]
+        if choice == "5":
+            return 30.0, "all"
+        return durations[choice], None
 
 
-PIN_MODES = ("auto", "p", "e", "none")
+PIN_MODES = ("auto", "p", "e", "lpe", "all", "none")
 
 
 def pin_arg(value: str) -> str:
@@ -70,35 +78,56 @@ def pin_arg(value: str) -> str:
     except ValueError:
         pass
     raise argparse.ArgumentTypeError(
-        f"ожидается auto, p, e, none или список CPU вида 0,2,4-7 (получено {value!r})"
+        "ожидается auto, p, e, lpe, all, none или список CPU вида 0,2,4-7 "
+        f"(получено {value!r})"
     )
 
 
-def resolve_pin(mode: str, backend) -> tuple[list[int] | None, str, list[str]]:
-    """Режим --pin -> (CPU для ST-фазы, подпись для отчёта, предупреждения).
+def _tier_phase(tier: str, cpus: list[int], tag: str = "ST", auto: bool = False) -> dict:
+    name = TIER_NAMES[tier]
+    label = f"{name}-ядра (CPU {format_cpulist(cpus)})" + (", авто" if auto else "")
+    return {"tag": tag, "cpus": cpus, "label": label, "core_kind": name}
 
-    На гибридных CPU (P + E-ядра) планировщик переносит однопоточную
-    нагрузку между ядрами разных типов, и ST-результат прыгает от прогона к
-    прогону. auto закрепляет ST-фазу на P-ядрах, если CPU гибридный."""
+
+def resolve_st(mode: str, backend) -> tuple[list[dict], list[str]]:
+    """Режим --pin -> (однопоточные фазы, предупреждения).
+
+    Фаза: {"tag", "cpus", "label", "core_kind"}. На гибридных CPU планировщик
+    переносит однопоточную нагрузку между ядрами разных типов, и результат
+    прыгает от прогона к прогону: auto закрепляет её на P-ядрах, p/e/lpe — на
+    ядрах выбранного типа, all — запускает отдельную фазу на каждом типе."""
+    plain = {"tag": "ST", "cpus": None, "label": "без закрепления", "core_kind": None}
     if mode == "none":
-        return None, "без закрепления", []
-    if mode in ("auto", "p", "e"):
+        return [plain], []
+    if mode in ("auto", "p", "e", "lpe", "all"):
         types = backend.core_types()
         if not types:
             if mode == "auto":
-                return None, "без закрепления (CPU не гибридный)", []
-            return None, "без закрепления", [
+                return [dict(plain, label="без закрепления (CPU не гибридный)")], []
+            return [plain], [
                 f"--pin {mode}: P/E-ядра не обнаружены (CPU не гибридный), "
                 "ST-фаза идёт без закрепления."
             ]
-        kind = "p" if mode == "auto" else mode
-        cpus = types[kind]
-        label = f"{'P' if kind == 'p' else 'E'}-ядра (CPU {format_cpulist(cpus)})"
         if mode == "auto":
-            label += ", авто"
-        return cpus, label, []
+            return [_tier_phase("p", types["p"], auto=True)], []
+        if mode == "all":
+            return [_tier_phase(t, types[t], tag=f"ST-{TIER_NAMES[t]}")
+                    for t in TIER_ORDER if types.get(t)], []
+        if not types.get(mode):
+            found = ", ".join(TIER_NAMES[t] for t in TIER_ORDER if types.get(t))
+            return [plain], [
+                f"--pin {mode}: {TIER_NAMES[mode]}-ядра не обнаружены "
+                f"(есть: {found}), ST-фаза идёт без закрепления."
+            ]
+        return [_tier_phase(mode, types[mode])], []
     cpus = parse_cpulist(mode)
-    return cpus, f"CPU {format_cpulist(cpus)}", []
+    return [dict(plain, cpus=cpus, label=f"CPU {format_cpulist(cpus)}")], []
+
+
+def resolve_pin(mode: str, backend) -> tuple[list[int] | None, str, list[str]]:
+    """Совместимость: одна ST-фаза -> (CPU, подпись, предупреждения)."""
+    phases, warns = resolve_st(mode, backend)
+    return phases[0]["cpus"], phases[0]["label"], warns
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -117,7 +146,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="пауза между фазами, с (0 = без паузы)")
     ap.add_argument("--pin", type=pin_arg, default="auto",
                     help="ядра для single-thread фазы: auto (P-ядра на гибридных CPU), "
-                         "p, e, none или список CPU, например 0,2,4-7")
+                         "p, e, lpe, all (отдельная фаза на каждом типе ядер), none "
+                         "или список CPU, например 0,2,4-7")
     ap.add_argument("--repeat", type=int, default=1,
                     help="повторить каждую фазу N раз; в отчёте медианы и разброс")
     ap.add_argument("--watts", type=float, default=None,
@@ -144,11 +174,15 @@ def main() -> int:
 
     reader = backend.PowerReader()
     reader.prime()
+    pin_mode = args.pin
     if interactive:
-        chosen = interactive_menu(reader)
+        chosen = interactive_menu(reader, hybrid=backend.core_types() is not None)
         if chosen is None:
             return 0
-        duration = chosen
+        duration, menu_pin = chosen
+        if menu_pin:
+            pin_mode = menu_pin
+            args.only_st = True
     else:
         if duration < 8:
             ap.error("--duration должен быть >= 8 секунд")
@@ -182,16 +216,17 @@ def main() -> int:
     if not manual:
         warnings += reader.hints()
 
-    phases_spec: list[tuple[int, str]] = []
-    if not args.only_st:
-        phases_spec.append((mt_threads, "MT"))
-    if not args.no_st:
-        phases_spec.append((1, "ST"))
-
-    st_cpus, pin_label, pin_warnings = resolve_pin(args.pin, backend)
+    st_phases, pin_warnings = resolve_st(pin_mode, backend)
     warnings += pin_warnings
+    phases_spec: list[dict] = []
+    if not args.only_st:
+        phases_spec.append({"tag": "MT", "threads": mt_threads, "cpus": None,
+                            "label": None, "core_kind": None})
+    if not args.no_st:
+        phases_spec += [dict(ph, threads=1) for ph in st_phases]
+
     repeat = args.repeat
-    plan = [(r, threads, tag) for r in range(repeat) for threads, tag in phases_spec]
+    plan = [(r, ph) for r in range(repeat) for ph in phases_spec]
     cooldown = args.cooldown if len(plan) > 1 else 0.0
     meta = {
         "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -220,30 +255,36 @@ def main() -> int:
         + (f" × {repeat} повтора(ов)" if repeat > 1 else "")
         + f" по {duration:.0f} с (прогрев {meta['warmup']:.0f} с), ~{total_time:.0f} с всего"
     )
-    if not args.no_st:
-        print(f"ST-фаза: {pin_label}")
+    for ph in phases_spec:
+        if ph["threads"] == 1:
+            print(f"{ph['tag']}: {ph['label']}")
     print()
 
     sampler = core.Sampler(reader)
     sampler.start()
-    runs: dict[str, list[dict]] = {tag: [] for _, tag in phases_spec}
+    runs: dict[str, list[dict]] = {ph["tag"]: [] for ph in phases_spec}
     try:
-        for idx, (r, threads, tag) in enumerate(plan):
+        for idx, (r, ph) in enumerate(plan):
             if idx > 0:
                 core.cooldown(cooldown)
+            threads, tag, cpus = ph["threads"], ph["tag"], ph["cpus"]
             label = "MULTI-THREAD" if threads > 1 else "SINGLE-THREAD"
+            if ph["core_kind"]:
+                label += f", {ph['core_kind']}-ядро"
             rep = f" #{r + 1}/{repeat}" if repeat > 1 else ""
             print(f"[{tag}{rep}] {label}, {threads} поток(ов), {duration:.0f} с ...", flush=True)
-            cpus = st_cpus if tag == "ST" else None
             res = core.apply_power_basis(
                 core.run_phase(exe, threads, duration, sampler, backend=backend, cpus=cpus),
                 manual,
             )
-            if tag == "ST":
+            res["tag"] = tag
+            res["core_kind"] = ph["core_kind"]
+            if threads == 1:
                 if cpus and not res["cpus"]:
                     res["pin_label"] = "без закрепления (не удалось задать аффинити)"
+                    res["core_kind"] = None
                 else:
-                    res["pin_label"] = pin_label
+                    res["pin_label"] = ph["label"]
             runs[tag].append(res)
             ppw = res["ppw"]
             power = res["power_w"]
@@ -255,7 +296,7 @@ def main() -> int:
             )
     finally:
         sampler.stop()
-    results = [core.aggregate_runs(runs[tag]) for _, tag in phases_spec]
+    results = [core.aggregate_runs(runs[ph["tag"]]) for ph in phases_spec]
 
     text = report.build_report(meta, results, source)
     print()

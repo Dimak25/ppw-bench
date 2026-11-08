@@ -48,6 +48,8 @@ def build_report(meta: dict, phases: list[dict], source: str) -> str:
 
     for i, ph in enumerate(phases, 1):
         kind = "MULTI-THREAD" if ph["threads"] > 1 else "SINGLE-THREAD"
+        if ph.get("core_kind"):
+            kind += f", {ph['core_kind']}-ядро"
         basis = ph.get("basis")
         L.append(f"ФАЗА {i} — {kind} ({ph['threads']} поток(ов))")
         L.append(f"  Производительность  : {fmt_si(ph['work_per_s'], 'ед/с')}")
@@ -89,6 +91,8 @@ def build_report(meta: dict, phases: list[dict], source: str) -> str:
     L.append("ИТОГ")
     for ph in phases:
         kind = "MT" if ph["threads"] > 1 else "ST"
+        if ph.get("core_kind"):
+            kind += f" ({ph['core_kind']})"
         if ph.get("ppw"):
             L.append(f"  {kind}: {fmt_si(ph['ppw'], 'ед/с на Вт')} ({BASIS_LABELS[ph['basis']]})")
         else:
