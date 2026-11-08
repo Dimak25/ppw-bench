@@ -359,7 +359,8 @@ class PowerReader:
         if any("pkg" in k.lower() for k in _read_array(self.handles.get("rapl"))):
             parts.append("RAPL (Energy Meter / rapl_package0_pkg)")
         if _read_array(self.handles.get("meter")):
-            parts.append("Power Meter (система)")
+            # драйвер батареи отдаёт мощность только при разряде
+            parts.append("Power Meter (система, только от батареи)")
         return ", ".join(parts) if parts else "датчики PDH не найдены"
 
     def sensor_lines(self) -> list[str]:

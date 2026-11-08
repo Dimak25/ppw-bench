@@ -60,3 +60,8 @@ def test_basis_priority():
 def test_coeff_var():
     assert core.coeff_var([1.0, 1.0]) is None
     assert core.coeff_var([1.0, 1.0, 1.0]) == 0.0
+
+
+def test_per_second_buckets():
+    window = [{"t": 10.0 + i * 0.2, "pkg": v} for i, v in enumerate([1, 3, 2, 2, 2, 5, 5, 5, 5, 5])]
+    assert core.per_second(window, "pkg", 10.0) == [2.0, 5.0]
