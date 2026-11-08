@@ -20,17 +20,27 @@ from ppwbench import util
 
 
 class Sampler(threading.Thread):
-    def __init__(self, reader, interval: float = 0.2) -> None:
+    """Фоновый опрос датчиков мощности и (если есть) частот ядер."""
+
+    def __init__(self, reader, interval: float = 0.2, freq_reader=None) -> None:
         super().__init__(daemon=True)
         self.reader = reader
+        self.freq_reader = freq_reader
         self.interval = interval
-        self.samples: list[dict[str, float]] = []
+        self.samples: list[dict] = []
         self._stop_event = threading.Event()
 
     def run(self) -> None:
         while not self._stop_event.is_set():
             t = time.perf_counter()
-            vals = self.reader.read()
+            vals = self.reader.read() or {}
+            if self.freq_reader is not None:
+                try:
+                    freq = self.freq_reader.read()
+                except Exception:
+                    freq = None
+                if freq:
+                    vals["freq"] = freq
             if vals:
                 vals["t"] = t
                 self.samples.append(vals)
@@ -187,8 +197,57 @@ def window_power(window: list[dict], key: str) -> float | None:
     return sum(vals) / len(vals) if vals else None
 
 
+BUSY_PCT = 50.0
+
+
+def summarize_freq(window: list[dict], cpus: list[int] | None,
+                   tiers: dict[str, list[int]] | None, single: bool) -> dict | None:
+    """Эффективная частота ядер, на которых шла фаза.
+
+    В каждом замере freq = {cpu: (МГц, загрузка %)}. Берём только занятые
+    ядра (загрузка >= 50 %): у простаивающих ядер частота ничего не говорит.
+    single — однопоточная фаза: частота самого загруженного ядра и его номер
+    (чаще всего встречавшийся). Иначе — среднее по занятым ядрам и, если
+    известны типы ядер, отдельно по P / E / LP-E."""
+    allowed = set(cpus) if cpus else None
+    per_sample: list[float] = []
+    busiest: dict[int, int] = {}
+    by_tier: dict[str, list[float]] = {}
+    tier_of = {c: t for t, lst in (tiers or {}).items() for c in lst}
+    for s in window:
+        freq = s.get("freq")
+        if not freq:
+            continue
+        busy = [(c, mhz, b) for c, (mhz, b) in freq.items()
+                if mhz and b is not None and b >= BUSY_PCT
+                and (allowed is None or c in allowed)]
+        if not busy:
+            continue
+        if single:
+            c, mhz, _b = max(busy, key=lambda x: x[2])
+            per_sample.append(mhz)
+            busiest[c] = busiest.get(c, 0) + 1
+        else:
+            per_sample.append(sum(m for _c, m, _b in busy) / len(busy))
+            groups: dict[str, list[float]] = {}
+            for c, mhz, _b in busy:
+                if c in tier_of:
+                    groups.setdefault(tier_of[c], []).append(mhz)
+            for t, vals in groups.items():
+                by_tier.setdefault(t, []).append(sum(vals) / len(vals))
+    if not per_sample:
+        return None
+    out: dict = {"mhz": sum(per_sample) / len(per_sample)}
+    if single and busiest:
+        out["cpu"] = max(busiest.items(), key=lambda kv: kv[1])[0]
+    if by_tier and len(by_tier) > 1:
+        out["tiers"] = {t: sum(v) / len(v) for t, v in by_tier.items()}
+    return out
+
+
 def run_phase(exe: Path, threads: int, duration: float, sampler: Sampler,
-              backend=None, cpus: list[int] | None = None) -> dict:
+              backend=None, cpus: list[int] | None = None,
+              tiers: dict[str, list[int]] | None = None) -> dict:
     """Один прогон bench. cpus — ограничить bench этими логическими CPU."""
     pin_ctx = backend.pinned(cpus) if (backend is not None and cpus) else contextlib.nullcontext()
     with pin_ctx as applied:
@@ -290,6 +349,7 @@ def run_phase(exe: Path, threads: int, duration: float, sampler: Sampler,
         "ppw": None,
         "energy_j": None,
         "samples": len(window),
+        "freq": summarize_freq(window, applied, tiers, single=(threads == 1)),
         "cpus": applied,
         "time_s": datetime.now(),
     }
@@ -348,6 +408,14 @@ def aggregate_runs(runs: list[dict]) -> dict:
         res[key] = _median([r.get(key) for r in runs])
     if res.get("samples") is not None:
         res["samples"] = int(res["samples"])
+    freqs = [r["freq"] for r in runs if r.get("freq")]
+    if freqs:
+        agg = dict(freqs[len(freqs) // 2])
+        agg["mhz"] = _median([f["mhz"] for f in freqs])
+        tiers = {t for f in freqs for t in f.get("tiers", {})}
+        if tiers:
+            agg["tiers"] = {t: _median([f.get("tiers", {}).get(t) for f in freqs]) for t in tiers}
+        res["freq"] = agg
     metric = "ppw" if all(r.get("ppw") for r in runs) else "work_per_s"
     vals = [r[metric] for r in runs]
     res["repeat"] = len(runs)
