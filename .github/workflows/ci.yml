@@ -43,6 +43,17 @@ jobs:
           chcp 65001 | Out-Null
           [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
           python ppw_bench.py --duration 8 --no-st --out ci-report.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Pinned ST + repeats (affinity API)
+        shell: pwsh
+        run: |
+          chcp 65001 | Out-Null
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          python ppw_bench.py --only-st --pin 0 --repeat 2 --cooldown 1 --duration 8 --out ci-pin.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-Content ci-pin.txt
+          if (-not (Select-String -Path ci-pin.txt -Pattern "Ядра\s+: CPU 0" -Quiet)) { throw "ST phase was not pinned" }
 
       - name: Upload report
         if: always()
@@ -80,6 +91,8 @@ jobs:
           python ppw_bench.py --list
           python ppw_bench.py --duration 8 --cooldown 1 --out ci-report.txt
           cat ci-report.txt
+          python ppw_bench.py --only-st --pin 0 --repeat 2 --cooldown 1 --duration 8 --out ci-pin.txt
+          grep -E "Ядра +: CPU 0" ci-pin.txt
 
       - name: Build tar.gz (no Nuitka)
         run: ./build-linux.sh --no-nuitka

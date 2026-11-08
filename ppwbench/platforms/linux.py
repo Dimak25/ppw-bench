@@ -13,11 +13,14 @@ RAPL в Linux отдаёт не мощность, а накопленную эн
 
 from __future__ import annotations
 
+import contextlib
 import os
 import platform
 import subprocess
 import time
 from pathlib import Path
+
+from ppwbench.cpusets import parse_cpulist, split_by_class
 
 NAME = "Linux"
 
@@ -90,6 +93,62 @@ def logical_cpus() -> int:
         return len(os.sched_getaffinity(0)) or 1
     except (AttributeError, OSError):
         return os.cpu_count() or 1
+
+
+def core_types() -> dict[str, list[int]] | None:
+    """Типы ядер гибридного CPU: {"p": [...], "e": [...]} или None.
+
+    Intel (Alder Lake и новее): PMU cpu_core / cpu_atom в /sys/devices.
+    Иначе (например, AMD Zen 5 + Zen 5c) — по максимальной частоте ядер:
+    гибридным считаем CPU, где медленные ядра уступают быстрым больше 13 %.
+    Небольшие различия (preferred cores у amd-pstate) гибридом не считаются."""
+    core = _read(SYSFS / "devices/cpu_core/cpus")
+    atom = _read(SYSFS / "devices/cpu_atom/cpus")
+    if core and atom:
+        try:
+            p, e = parse_cpulist(core), parse_cpulist(atom)
+        except ValueError:
+            p, e = [], []
+        if p and e:
+            return {"p": p, "e": e}
+
+    freqs: dict[int, float] = {}
+    for d in (SYSFS / "devices/system/cpu").glob("cpu[0-9]*"):
+        f = _read_int(d / "cpufreq/cpuinfo_max_freq")
+        if f:
+            freqs[int(d.name[3:])] = float(f)
+    if len(freqs) < 2:
+        return None
+    top = max(freqs.values())
+    if min(freqs.values()) / top > 0.87:
+        return None
+    return split_by_class({c: (1.0 if f >= 0.9 * top else 0.0) for c, f in freqs.items()})
+
+
+@contextlib.contextmanager
+def pinned(cpus: list[int] | None):
+    """Процессы, запущенные внутри блока, работают только на cpus.
+
+    В Linux аффинити наследуется от потока, который делает fork/exec:
+    ограничиваем текущий поток, запускаем bench и возвращаем маску.
+    Фоновый поток опроса датчиков это не затрагивает."""
+    if not cpus:
+        yield None
+        return
+    try:
+        saved = os.sched_getaffinity(0)
+    except (AttributeError, OSError):
+        yield None
+        return
+    target = set(cpus) & saved
+    if not target:
+        yield None
+        return
+    os.sched_setaffinity(0, target)
+    try:
+        yield sorted(target)
+    finally:
+        os.sched_setaffinity(0, saved)
 
 
 def _power_supplies() -> list[tuple[Path, str]]:

@@ -16,6 +16,7 @@ import platform
 from datetime import datetime
 
 from ppwbench import __version__, core, report, util
+from ppwbench.cpusets import format_cpulist, parse_cpulist
 from ppwbench.platforms import current as current_backend
 from ppwbench.util import fmt_si
 
@@ -56,6 +57,50 @@ def interactive_menu(reader) -> float | None:
         return durations[choice]
 
 
+PIN_MODES = ("auto", "p", "e", "none")
+
+
+def pin_arg(value: str) -> str:
+    v = value.strip().lower()
+    if v in PIN_MODES:
+        return v
+    try:
+        if parse_cpulist(v):
+            return v
+    except ValueError:
+        pass
+    raise argparse.ArgumentTypeError(
+        f"ожидается auto, p, e, none или список CPU вида 0,2,4-7 (получено {value!r})"
+    )
+
+
+def resolve_pin(mode: str, backend) -> tuple[list[int] | None, str, list[str]]:
+    """Режим --pin -> (CPU для ST-фазы, подпись для отчёта, предупреждения).
+
+    На гибридных CPU (P + E-ядра) планировщик переносит однопоточную
+    нагрузку между ядрами разных типов, и ST-результат прыгает от прогона к
+    прогону. auto закрепляет ST-фазу на P-ядрах, если CPU гибридный."""
+    if mode == "none":
+        return None, "без закрепления", []
+    if mode in ("auto", "p", "e"):
+        types = backend.core_types()
+        if not types:
+            if mode == "auto":
+                return None, "без закрепления (CPU не гибридный)", []
+            return None, "без закрепления", [
+                f"--pin {mode}: P/E-ядра не обнаружены (CPU не гибридный), "
+                "ST-фаза идёт без закрепления."
+            ]
+        kind = "p" if mode == "auto" else mode
+        cpus = types[kind]
+        label = f"{'P' if kind == 'p' else 'E'}-ядра (CPU {format_cpulist(cpus)})"
+        if mode == "auto":
+            label += ", авто"
+        return cpus, label, []
+    cpus = parse_cpulist(mode)
+    return cpus, f"CPU {format_cpulist(cpus)}", []
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="ppw-bench",
@@ -70,6 +115,11 @@ def build_parser() -> argparse.ArgumentParser:
     phase_group.add_argument("--only-st", action="store_true", help="только single-thread фаза")
     ap.add_argument("--cooldown", type=float, default=DEFAULT_COOLDOWN,
                     help="пауза между фазами, с (0 = без паузы)")
+    ap.add_argument("--pin", type=pin_arg, default="auto",
+                    help="ядра для single-thread фазы: auto (P-ядра на гибридных CPU), "
+                         "p, e, none или список CPU, например 0,2,4-7")
+    ap.add_argument("--repeat", type=int, default=1,
+                    help="повторить каждую фазу N раз; в отчёте медианы и разброс")
     ap.add_argument("--watts", type=float, default=None,
                     help="задать мощность CPU вручную (если датчики недоступны)")
     ap.add_argument("--out", type=str, default=None, help="путь к .txt-отчёту")
@@ -89,6 +139,8 @@ def main() -> int:
     duration = 20.0 if args.quick else args.duration
     if args.cooldown < 0:
         ap.error("--cooldown не может быть отрицательным")
+    if not 1 <= args.repeat <= 20:
+        ap.error("--repeat должен быть от 1 до 20")
 
     reader = backend.PowerReader()
     reader.prime()
@@ -136,7 +188,11 @@ def main() -> int:
     if not args.no_st:
         phases_spec.append((1, "ST"))
 
-    cooldown = args.cooldown if len(phases_spec) > 1 else 0.0
+    st_cpus, pin_label, pin_warnings = resolve_pin(args.pin, backend)
+    warnings += pin_warnings
+    repeat = args.repeat
+    plan = [(r, threads, tag) for r in range(repeat) for threads, tag in phases_spec]
+    cooldown = args.cooldown if len(plan) > 1 else 0.0
     meta = {
         "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "cpu": backend.cpu_name(),
@@ -148,33 +204,47 @@ def main() -> int:
         "duration": duration,
         "warmup": core.warmup_seconds(duration),
         "cooldown": cooldown,
+        "repeat": repeat,
         "version": __version__,
         "warnings": warnings,
     }
 
-    total_time = (duration + 3) * len(phases_spec) + cooldown * (len(phases_spec) - 1)
+    total_time = (duration + 3) * len(plan) + cooldown * (len(plan) - 1)
     print(f"CPU: {meta['cpu']}  ({meta['cores']} ядер / {meta['threads']} потоков)")
     print(f"Мощность: {source}")
     print(f"Питание: {power_note}; {meta['profile']}")
     for w in warnings:
         print(f"  ! {w}")
     print(
-        f"План: {len(phases_spec)} фаза(ы) по {duration:.0f} с "
-        f"(прогрев {meta['warmup']:.0f} с), ~{total_time:.0f} с всего"
+        f"План: {len(phases_spec)} фаза(ы)"
+        + (f" × {repeat} повтора(ов)" if repeat > 1 else "")
+        + f" по {duration:.0f} с (прогрев {meta['warmup']:.0f} с), ~{total_time:.0f} с всего"
     )
+    if not args.no_st:
+        print(f"ST-фаза: {pin_label}")
     print()
 
     sampler = core.Sampler(reader)
     sampler.start()
-    results: list[dict] = []
+    runs: dict[str, list[dict]] = {tag: [] for _, tag in phases_spec}
     try:
-        for idx, (threads, tag) in enumerate(phases_spec):
+        for idx, (r, threads, tag) in enumerate(plan):
             if idx > 0:
                 core.cooldown(cooldown)
             label = "MULTI-THREAD" if threads > 1 else "SINGLE-THREAD"
-            print(f"[{tag}] {label}, {threads} поток(ов), {duration:.0f} с ...", flush=True)
-            res = core.apply_power_basis(core.run_phase(exe, threads, duration, sampler), manual)
-            results.append(res)
+            rep = f" #{r + 1}/{repeat}" if repeat > 1 else ""
+            print(f"[{tag}{rep}] {label}, {threads} поток(ов), {duration:.0f} с ...", flush=True)
+            cpus = st_cpus if tag == "ST" else None
+            res = core.apply_power_basis(
+                core.run_phase(exe, threads, duration, sampler, backend=backend, cpus=cpus),
+                manual,
+            )
+            if tag == "ST":
+                if cpus and not res["cpus"]:
+                    res["pin_label"] = "без закрепления (не удалось задать аффинити)"
+                else:
+                    res["pin_label"] = pin_label
+            runs[tag].append(res)
             ppw = res["ppw"]
             power = res["power_w"]
             print(
@@ -185,6 +255,7 @@ def main() -> int:
             )
     finally:
         sampler.stop()
+    results = [core.aggregate_runs(runs[tag]) for _, tag in phases_spec]
 
     text = report.build_report(meta, results, source)
     print()

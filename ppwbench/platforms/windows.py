@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import os
 import platform
@@ -12,6 +13,8 @@ import subprocess
 import time
 import winreg
 from ctypes import wintypes
+
+from ppwbench.cpusets import parse_cpu_set_information, split_by_class
 
 NAME = "Windows"
 CREATE_NO_WINDOW = 0x08000000
@@ -65,6 +68,65 @@ def physical_cores() -> int | None:
 
 def logical_cpus() -> int:
     return os.cpu_count() or 1
+
+
+def core_types() -> dict[str, list[int]] | None:
+    """Типы ядер гибридного CPU по EfficiencyClass (GetSystemCpuSetInformation).
+
+    Чем выше класс, тем производительнее ядро: P-ядра — наибольший класс,
+    E и LP-E — остальные. На обычных CPU класс у всех ядер 0 -> None."""
+    try:
+        k32 = ctypes.windll.kernel32
+        fn = k32.GetSystemCpuSetInformation
+        fn.argtypes = [ctypes.c_void_p, wintypes.ULONG, ctypes.POINTER(wintypes.ULONG),
+                       wintypes.HANDLE, wintypes.ULONG]
+        fn.restype = wintypes.BOOL
+        length = wintypes.ULONG(0)
+        fn(None, 0, ctypes.byref(length), None, 0)
+        if length.value == 0:
+            return None
+        buf = ctypes.create_string_buffer(length.value)
+        if not fn(buf, length, ctypes.byref(length), None, 0):
+            return None
+        return split_by_class(parse_cpu_set_information(buf.raw[: length.value]))
+    except Exception:
+        return None
+
+
+@contextlib.contextmanager
+def pinned(cpus: list[int] | None):
+    """Процессы, запущенные внутри блока, работают только на cpus.
+
+    Дочерний процесс наследует маску аффинити родителя: на время запуска
+    bench ограничиваем свой процесс, затем возвращаем прежнюю маску. Так
+    потоки bench с первой же инструкции идут на нужных ядрах."""
+    if not cpus:
+        yield None
+        return
+    k32 = ctypes.windll.kernel32
+    k32.GetCurrentProcess.restype = wintypes.HANDLE
+    k32.GetProcessAffinityMask.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)]
+    k32.GetProcessAffinityMask.restype = wintypes.BOOL
+    k32.SetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.c_size_t]
+    k32.SetProcessAffinityMask.restype = wintypes.BOOL
+    me = k32.GetCurrentProcess()
+    proc_mask, sys_mask = ctypes.c_size_t(0), ctypes.c_size_t(0)
+    if not k32.GetProcessAffinityMask(me, ctypes.byref(proc_mask), ctypes.byref(sys_mask)):
+        yield None
+        return
+    want = 0
+    for c in cpus:
+        if 0 <= c < 64:
+            want |= 1 << c
+    want &= proc_mask.value
+    if not want or not k32.SetProcessAffinityMask(me, want):
+        yield None
+        return
+    try:
+        yield [c for c in range(64) if want >> c & 1]
+    finally:
+        k32.SetProcessAffinityMask(me, proc_mask.value)
 
 
 class SYSTEM_POWER_STATUS(ctypes.Structure):

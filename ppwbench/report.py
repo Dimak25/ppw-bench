@@ -30,7 +30,9 @@ def build_report(meta: dict, phases: list[dict], source: str) -> str:
         L.append(f"Профиль питания   : {meta['profile']}")
     L.append(f"Источник мощности : {source}")
     L.append(f"Длительность      : {meta['duration']:.0f} с на фазу (прогрев {meta['warmup']:.0f} с)")
-    if meta.get("cooldown") and len(phases) > 1:
+    if meta.get("repeat", 1) > 1:
+        L.append(f"Повторов          : {meta['repeat']} (в фазах — медианы)")
+    if meta.get("cooldown") and (len(phases) > 1 or meta.get("repeat", 1) > 1):
         L.append(f"Пауза между фазами: {meta['cooldown']:.0f} с")
     build = next((ph.get("build") for ph in phases if ph.get("build")), None)
     if build:
@@ -74,6 +76,14 @@ def build_report(meta: dict, phases: list[dict], source: str) -> str:
         if stab:
             L.append(f"  Стабильность        : {', '.join(stab)}")
         L.append(f"  Окно измерения      : {ph['steady']:.1f} с, {ph['samples']} замеров")
+        if ph.get("pin_label"):
+            L.append(f"  Ядра                : {ph['pin_label']}")
+        if ph.get("repeat", 1) > 1:
+            is_ppw = ph["runs_metric"] == "ppw"
+            series = _fmt_series(ph["runs_values"], "ед/с на Вт" if is_ppw else "ед/с")
+            spread = f", разброс ±{ph['runs_cv']:.1f}%" if ph.get("runs_cv") is not None else ""
+            L.append(f"  {'Повторы (' + str(ph['repeat']) + ')':<20}: "
+                     f"{'PPW' if is_ppw else 'скорость'} {series}{spread}")
         L.append(dash)
 
     L.append("ИТОГ")
@@ -88,6 +98,16 @@ def build_report(meta: dict, phases: list[dict], source: str) -> str:
     L.append("Чем выше — тем эффективнее. Сравнивайте прогоны при одинаковой")
     L.append("длительности, питании от сети и фоновой нагрузке.")
     return "\n".join(L)
+
+
+def _fmt_series(vals: list[float], unit: str) -> str:
+    """[9.6e7, 9.5e7] -> "96.4 / 95.1 Mед/с на Вт" (одна приставка на все)."""
+    top = max(abs(v) for v in vals)
+    for div, prefix in ((1e9, "G"), (1e6, "M"), (1e3, "k"), (1.0, "")):
+        if top >= div:
+            break
+    nums = " / ".join(f"{v / div:.1f}" for v in vals)
+    return f"{nums} {prefix}{unit}"
 
 
 def _give_back_to_sudo_user(path: Path) -> None:

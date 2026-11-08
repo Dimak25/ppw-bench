@@ -169,11 +169,32 @@ save the `.txt` report and keeps the window open.
 | `--no-st` | multi-thread phase only |
 | `--only-st` | single-thread phase only |
 | `--cooldown N` | pause between phases in seconds (default 10, 0 = none) |
+| `--pin MODE` | cores for the single-thread phase: `auto` (default), `p`, `e`, `none` or a CPU list (`0,2,4-7`) |
+| `--repeat N` | run each phase N times; the report shows medians and the run-to-run spread |
 | `--watts N` | use a fixed CPU wattage (no sensors available) |
 | `--out FILE` | report path (default `ppw-report-*.txt`) |
 | `--list` | list detected sensors and exit |
 | `--interactive` | open the interactive menu |
 | `--version` | print the version and exit |
+
+### Hybrid CPUs and repeats
+
+Hybrid CPUs (Intel 12th gen and newer, Core Ultra, AMD Zen 5 + Zen 5c) mix
+P (performance) and E (efficiency) cores. The OS scheduler moves a
+single-threaded load between them, so the ST result can swing by ~10 % between
+runs.
+
+* `--pin auto` (default) — on a hybrid CPU the ST phase runs on P-cores only;
+  nothing changes on a regular CPU. The report's "Ядра" (cores) line shows
+  which cores were used.
+* `--pin e` — measure E-core efficiency; `--pin none` — the old behaviour.
+* `--repeat 3` — every phase three times; the report shows medians and a
+  "Повторы" (repeats) line with the run-to-run spread. If two machines differ
+  by less than that spread, treat them as equal.
+
+```bat
+ppw-bench.exe --quick --repeat 3
+```
 
 ## Sample output
 
