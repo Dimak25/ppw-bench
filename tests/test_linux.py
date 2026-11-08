@@ -179,3 +179,29 @@ def test_core_types_zen5c_with_own_l3_is_not_lpe(sysfs):
         _freq(sysfs, c, 3_300_000)
         _cache(sysfs, c, 3, "4-11")
     assert linux.core_types() == {"p": [0, 1, 2, 3], "e": list(range(4, 12))}
+
+
+def test_freq_reader_cpufreq_and_busy(sysfs, monkeypatch):
+    (sysfs / "proc").mkdir()
+    stat = sysfs / "proc/stat"
+    stat.write_text("cpu  0 0 0 0 0 0 0 0\ncpu0 100 0 0 900 0 0 0 0\ncpu1 100 0 0 900 0 0 0 0\n")
+    for c, khz in ((0, 4_800_000), (1, 1_100_000)):
+        d = sysfs / f"devices/system/cpu/cpu{c}/cpufreq"
+        d.mkdir(parents=True)
+        (d / "scaling_cur_freq").write_text(f"{khz}\n")
+    r = linux.FreqReader()
+    assert r.source == "cpufreq"
+    # CPU 1 загружен на 100 %, CPU 0 простаивает
+    stat.write_text("cpu  0 0 0 0 0 0 0 0\ncpu0 100 0 0 1000 0 0 0 0\ncpu1 200 0 0 900 0 0 0 0\n")
+    vals = r.read()
+    assert vals[0] == (4800.0, 0.0)
+    assert vals[1] == (1100.0, 100.0)
+
+
+def test_freq_reader_cpuinfo_fallback(sysfs):
+    (sysfs / "proc").mkdir()
+    (sysfs / "proc/stat").write_text("cpu0 1 0 0 1 0 0 0 0\n")
+    (sysfs / "proc/cpuinfo").write_text("processor\t: 0\ncpu MHz\t\t: 2300.000\n")
+    r = linux.FreqReader()
+    assert r.source == "cpuinfo"
+    assert r.read()[0][0] == 2300.0

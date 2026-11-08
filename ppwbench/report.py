@@ -9,6 +9,7 @@ from pathlib import Path
 
 from ppwbench import util
 from ppwbench.core import BASIS_LABELS
+from ppwbench.cpusets import TIER_NAMES, TIER_ORDER
 from ppwbench.util import fmt_si
 
 ENERGY_TAGS = {"pkg": "пакет", "sys": "система", "manual": "вручную"}
@@ -77,6 +78,9 @@ def build_report(meta: dict, phases: list[dict], source: str) -> str:
             stab.append(f"скорость ±{ph['rate_cv']:.1f}%")
         if stab:
             L.append(f"  Стабильность        : {', '.join(stab)}")
+        freq_line = format_freq(ph.get("freq"), single=ph["threads"] == 1)
+        if freq_line:
+            L.append(f"  {'Частота ядра' if ph['threads'] == 1 else 'Частота ядер':<20}: {freq_line}")
         L.append(f"  Окно измерения      : {ph['steady']:.1f} с, {ph['samples']} замеров")
         if ph.get("pin_label"):
             L.append(f"  Ядра                : {ph['pin_label']}")
@@ -102,6 +106,22 @@ def build_report(meta: dict, phases: list[dict], source: str) -> str:
     L.append("Чем выше — тем эффективнее. Сравнивайте прогоны при одинаковой")
     L.append("длительности, питании от сети и фоновой нагрузке.")
     return "\n".join(L)
+
+
+def format_freq(freq: dict | None, single: bool) -> str | None:
+    """{"mhz", "cpu"?, "tiers"?} -> "1.12 ГГц (CPU 4)" / "3.10 ГГц в среднем; P 3.40, E 2.60 ГГц"."""
+    if not freq or not freq.get("mhz"):
+        return None
+    text = f"{freq['mhz'] / 1000:.2f} ГГц"
+    if single:
+        if freq.get("cpu") is not None:
+            text += f" (CPU {freq['cpu']})"
+        return text
+    tiers = freq.get("tiers")
+    if tiers:
+        parts = [f"{TIER_NAMES[t]} {tiers[t] / 1000:.2f}" for t in TIER_ORDER if tiers.get(t)]
+        text += " в среднем; " + ", ".join(parts) + " ГГц"
+    return text
 
 
 def _fmt_series(vals: list[float], unit: str) -> str:

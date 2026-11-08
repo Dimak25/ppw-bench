@@ -331,6 +331,88 @@ def compiler_candidates() -> list[str]:
 
 
 # --------------------------------------------------------------------------
+#  Частоты ядер
+# --------------------------------------------------------------------------
+
+
+def _per_cpu_stat() -> dict[int, tuple[int, int]]:
+    """{cpu: (idle, total)} из /proc/stat."""
+    out: dict[int, tuple[int, int]] = {}
+    for line in (_read(PROCFS / "stat") or "").splitlines():
+        if not line.startswith("cpu") or line.startswith("cpu "):
+            continue
+        parts = line.split()
+        try:
+            cpu = int(parts[0][3:])
+            vals = [int(v) for v in parts[1:9]]
+        except (ValueError, IndexError):
+            continue
+        idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+        out[cpu] = (idle, sum(vals))
+    return out
+
+
+def _cpuinfo_mhz() -> dict[int, float]:
+    """{cpu: МГц} из /proc/cpuinfo (запасной путь, если нет cpufreq)."""
+    out: dict[int, float] = {}
+    cpu = None
+    for line in (_read(PROCFS / "cpuinfo") or "").splitlines():
+        name, sep, value = line.partition(":")
+        if not sep:
+            continue
+        name = name.strip()
+        try:
+            if name == "processor":
+                cpu = int(value)
+            elif name == "cpu MHz" and cpu is not None:
+                out[cpu] = float(value)
+        except ValueError:
+            continue
+    return out
+
+
+class FreqReader:
+    """Частота и загрузка каждого логического CPU.
+
+    Частота — cpufreq/scaling_cur_freq (у intel_pstate / amd-pstate это
+    средняя частота по APERF/MPERF, root не нужен); если cpufreq нет
+    (виртуальные машины) — «cpu MHz» из /proc/cpuinfo. Загрузка — по
+    разнице счётчиков /proc/stat между двумя замерами."""
+
+    def __init__(self) -> None:
+        base = SYSFS / "devices/system/cpu"
+        self._sysfs: dict[int, Path] = {}
+        for d in base.glob("cpu[0-9]*"):
+            f = d / "cpufreq/scaling_cur_freq"
+            if f.exists():
+                self._sysfs[int(d.name[3:])] = f
+        self._prev = _per_cpu_stat()
+        self.source = "cpufreq" if self._sysfs else "cpuinfo"
+
+    def read(self) -> dict[int, tuple[float, float | None]]:
+        stat = _per_cpu_stat()
+        if self._sysfs:
+            mhz = {}
+            for c, f in self._sysfs.items():
+                khz = _read_int(f)
+                if khz:
+                    mhz[c] = khz / 1000.0
+        else:
+            mhz = _cpuinfo_mhz()
+        out: dict[int, tuple[float, float | None]] = {}
+        for c, m in mhz.items():
+            busy = None
+            if c in stat and c in self._prev:
+                d_idle = stat[c][0] - self._prev[c][0]
+                d_total = stat[c][1] - self._prev[c][1]
+                if d_total > 0:
+                    busy = max(0.0, min(100.0, 100.0 * (1 - d_idle / d_total)))
+            out[c] = (m, busy)
+        self._prev = stat
+        return out
+
+
+# --------------------------------------------------------------------------
 #  RAPL через powercap
 # --------------------------------------------------------------------------
 

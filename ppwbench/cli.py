@@ -260,7 +260,12 @@ def main() -> int:
             print(f"{ph['tag']}: {ph['label']}")
     print()
 
-    sampler = core.Sampler(reader)
+    try:
+        freq_reader = backend.FreqReader()
+    except Exception:
+        freq_reader = None
+    tiers = backend.core_types()
+    sampler = core.Sampler(reader, freq_reader=freq_reader)
     sampler.start()
     runs: dict[str, list[dict]] = {ph["tag"]: [] for ph in phases_spec}
     try:
@@ -274,7 +279,8 @@ def main() -> int:
             rep = f" #{r + 1}/{repeat}" if repeat > 1 else ""
             print(f"[{tag}{rep}] {label}, {threads} поток(ов), {duration:.0f} с ...", flush=True)
             res = core.apply_power_basis(
-                core.run_phase(exe, threads, duration, sampler, backend=backend, cpus=cpus),
+                core.run_phase(exe, threads, duration, sampler, backend=backend, cpus=cpus,
+                               tiers=tiers),
                 manual,
             )
             res["tag"] = tag
@@ -288,10 +294,12 @@ def main() -> int:
             runs[tag].append(res)
             ppw = res["ppw"]
             power = res["power_w"]
+            freq = res.get("freq")
             print(
                 f"     {fmt_si(res['work_per_s'], 'ед/с')}"
                 + (f"   {power:.1f} Вт" if power else "")
-                + (f"   PPW {fmt_si(ppw, 'ед/с на Вт')}" if ppw else ""),
+                + (f"   PPW {fmt_si(ppw, 'ед/с на Вт')}" if ppw else "")
+                + (f"   {freq['mhz'] / 1000:.2f} ГГц" if freq else ""),
                 flush=True,
             )
     finally:

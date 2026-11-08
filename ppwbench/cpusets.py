@@ -41,6 +41,14 @@ def format_cpulist(cpus: list[int]) -> str:
     return ",".join(out)
 
 
+def pdh_cpu_index(instance: str) -> int | None:
+    """Экземпляр PDH "0,5" (группа 0, логический CPU 5) -> 5; _Total и группы 1+ -> None."""
+    group, sep, idx = instance.partition(",")
+    if not sep or group != "0" or not idx.isdigit():
+        return None
+    return int(idx)
+
+
 TIER_ORDER = ("p", "e", "lpe")
 TIER_NAMES = {"p": "P", "e": "E", "lpe": "LP-E"}
 
