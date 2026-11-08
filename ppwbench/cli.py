@@ -260,12 +260,8 @@ def main() -> int:
             print(f"{ph['tag']}: {ph['label']}")
     print()
 
-    try:
-        freq_reader = backend.FreqReader()
-    except Exception:
-        freq_reader = None
     tiers = backend.core_types()
-    sampler = core.Sampler(reader, freq_reader=freq_reader)
+    sampler = core.Sampler(reader)
     sampler.start()
     runs: dict[str, list[dict]] = {ph["tag"]: [] for ph in phases_spec}
     try:

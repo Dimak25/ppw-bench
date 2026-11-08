@@ -54,6 +54,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-Content ci-pin.txt
           if (-not (Select-String -Path ci-pin.txt -Pattern "Ядра\s+: CPU 0" -Quiet)) { throw "ST phase was not pinned" }
+          if (-not (Select-String -Path ci-pin.txt -Pattern "Частота ядра\s+: [0-9.]+ ГГц \(CPU 0\)" -Quiet)) { throw "no clock probe result" }
 
       - name: Upload report
         if: always()
@@ -93,6 +94,7 @@ jobs:
           cat ci-report.txt
           python ppw_bench.py --only-st --pin 0 --repeat 2 --cooldown 1 --duration 8 --out ci-pin.txt
           grep -E "Ядра +: CPU 0" ci-pin.txt
+          grep -E "Частота ядра +: [0-9.]+ ГГц \(CPU 0\)" ci-pin.txt
 
       - name: Build tar.gz (no Nuitka)
         run: ./build-linux.sh --no-nuitka

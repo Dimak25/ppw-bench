@@ -20,12 +20,11 @@ from ppwbench import util
 
 
 class Sampler(threading.Thread):
-    """Фоновый опрос датчиков мощности и (если есть) частот ядер."""
+    """Фоновый опрос датчиков мощности."""
 
-    def __init__(self, reader, interval: float = 0.2, freq_reader=None) -> None:
+    def __init__(self, reader, interval: float = 0.2) -> None:
         super().__init__(daemon=True)
         self.reader = reader
-        self.freq_reader = freq_reader
         self.interval = interval
         self.samples: list[dict] = []
         self._stop_event = threading.Event()
@@ -34,13 +33,6 @@ class Sampler(threading.Thread):
         while not self._stop_event.is_set():
             t = time.perf_counter()
             vals = self.reader.read() or {}
-            if self.freq_reader is not None:
-                try:
-                    freq = self.freq_reader.read()
-                except Exception:
-                    freq = None
-                if freq:
-                    vals["freq"] = freq
             if vals:
                 vals["t"] = t
                 self.samples.append(vals)
@@ -197,51 +189,29 @@ def window_power(window: list[dict], key: str) -> float | None:
     return sum(vals) / len(vals) if vals else None
 
 
-BUSY_PCT = 50.0
+def summarize_probe(probes: list[tuple[int, float]],
+                    tiers: dict[str, list[int]] | None, single: bool) -> dict | None:
+    """Частота ядер по замеру самого bench (строки FREQ <поток> <cpu> <МГц>).
 
-
-def summarize_freq(window: list[dict], cpus: list[int] | None,
-                   tiers: dict[str, list[int]] | None, single: bool) -> dict | None:
-    """Эффективная частота ядер, на которых шла фаза.
-
-    В каждом замере freq = {cpu: (МГц, загрузка %)}. Берём только занятые
-    ядра (загрузка >= 50 %): у простаивающих ядер частота ничего не говорит.
-    single — однопоточная фаза: частота самого загруженного ядра и его номер
-    (чаще всего встречавшийся). Иначе — среднее по занятым ядрам и, если
-    известны типы ядер, отдельно по P / E / LP-E."""
-    allowed = set(cpus) if cpus else None
-    per_sample: list[float] = []
-    busiest: dict[int, int] = {}
-    by_tier: dict[str, list[float]] = {}
-    tier_of = {c: t for t, lst in (tiers or {}).items() for c in lst}
-    for s in window:
-        freq = s.get("freq")
-        if not freq:
-            continue
-        busy = [(c, mhz, b) for c, (mhz, b) in freq.items()
-                if mhz and b is not None and b >= BUSY_PCT
-                and (allowed is None or c in allowed)]
-        if not busy:
-            continue
-        if single:
-            c, mhz, _b = max(busy, key=lambda x: x[2])
-            per_sample.append(mhz)
-            busiest[c] = busiest.get(c, 0) + 1
-        else:
-            per_sample.append(sum(m for _c, m, _b in busy) / len(busy))
-            groups: dict[str, list[float]] = {}
-            for c, mhz, _b in busy:
-                if c in tier_of:
-                    groups.setdefault(tier_of[c], []).append(mhz)
-            for t, vals in groups.items():
-                by_tier.setdefault(t, []).append(sum(vals) / len(vals))
-    if not per_sample:
+    bench в конце фазы, не давая ядру остыть, крутит цепочку зависимых
+    сложений (1 такт каждое) — это прямой замер тактовой частоты, без
+    счётчиков ОС. single — однопоточная фаза: частота и номер CPU.
+    Иначе — среднее по потокам и, если известны типы ядер, по P / E / LP-E."""
+    probes = [(c, m) for c, m in probes if m and m > 0]
+    if not probes:
         return None
-    out: dict = {"mhz": sum(per_sample) / len(per_sample)}
-    if single and busiest:
-        out["cpu"] = max(busiest.items(), key=lambda kv: kv[1])[0]
-    if by_tier and len(by_tier) > 1:
-        out["tiers"] = {t: sum(v) / len(v) for t, v in by_tier.items()}
+    out: dict = {"mhz": sum(m for _c, m in probes) / len(probes)}
+    if single:
+        if probes[0][0] >= 0:
+            out["cpu"] = probes[0][0]
+        return out
+    tier_of = {c: t for t, lst in (tiers or {}).items() for c in lst}
+    groups: dict[str, list[float]] = {}
+    for c, m in probes:
+        if c in tier_of:
+            groups.setdefault(tier_of[c], []).append(m)
+    if len(groups) > 1:
+        out["tiers"] = {t: sum(v) / len(v) for t, v in groups.items()}
     return out
 
 
@@ -263,6 +233,7 @@ def run_phase(exe: Path, threads: int, duration: float, sampler: Sampler,
     t_start = None
     t_end = None
     build = None
+    probes: list[tuple[int, float]] = []  # (cpu, МГц) из строк FREQ
     ticks: list[tuple[float, float]] = []  # (elapsed_ms, work)
     line_buf = b""
     try:
@@ -284,8 +255,15 @@ def run_phase(exe: Path, threads: int, duration: float, sampler: Sampler,
                     build = line[6:].strip()
                 elif parts[0] == "TICK" and len(parts) >= 3:
                     ticks.append((float(parts[1]), float(parts[2])))
-                elif parts[0] == "DONE" and len(parts) >= 3:
+                elif parts[0] == "STOP" and len(parts) >= 3:
+                    # нагрузка закончилась; дальше bench меряет частоту
                     t_end = now
+                    ticks.append((float(parts[1]), float(parts[2])))
+                elif parts[0] == "FREQ" and len(parts) >= 4:
+                    probes.append((int(parts[2]), float(parts[3])))
+                elif parts[0] == "DONE" and len(parts) >= 3:
+                    if t_end is None:  # старый bench без STOP
+                        t_end = now
                     ticks.append((float(parts[1]), float(parts[2])))
         proc.wait(timeout=10)
     except BaseException:
@@ -349,7 +327,7 @@ def run_phase(exe: Path, threads: int, duration: float, sampler: Sampler,
         "ppw": None,
         "energy_j": None,
         "samples": len(window),
-        "freq": summarize_freq(window, applied, tiers, single=(threads == 1)),
+        "freq": summarize_probe(probes, tiers, single=(threads == 1)),
         "cpus": applied,
         "time_s": datetime.now(),
     }
