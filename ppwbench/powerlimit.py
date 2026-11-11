@@ -11,13 +11,22 @@ Linux (Intel): лимиты PL1/PL2 пишутся в powercap:
 Исходные значения запоминаются в save() и обязательно возвращаются в
 restore() — иначе после сбоя ноутбук останется, например, на 5 Вт.
 
-Windows: штатного API для PL1 нет, поэтому лимит выставляет пользователь
-(ThrottleStop / Intel XTU), а программа ждёт Enter (ManualLimiter).
+Windows: штатного API для PL1 нет. Два варианта:
+  * FreqCapLimiter (авто) — эмуляция лимита: потолок частоты плана
+    электропитания (PROCFREQMAX / PROCFREQMAX1) подбирается регулятором под
+    нагрузкой, пока мощность пакета не станет равна ступени. Процессор при
+    этом снижает и частоту, и напряжение — как при PL1. Работает только для
+    MT: однопоточную нагрузку потолок на практике не ограничивает.
+  * ManualLimiter — лимит выставляет пользователь (ThrottleStop / Intel XTU),
+    а программа ждёт Enter.
 """
 
 from __future__ import annotations
 
 import os
+import re
+import subprocess
+import time
 from pathlib import Path
 
 POWERCAP = Path("/sys/class/powercap")
@@ -28,7 +37,11 @@ MIN_W, MAX_W = 3.0, 250.0
 
 
 class LimitError(RuntimeError):
-    """Лимит не удалось выставить или он не принят."""
+    """Лимит не удалось выставить или он не принят: замер останавливается."""
+
+
+class StepSkipped(LimitError):
+    """Эта ступень недостижима (например, ниже минимальной мощности) — пропускаем её."""
 
 
 def parse_steps(text: str) -> list[float]:
@@ -88,6 +101,7 @@ class PowercapLimiter:
     """Автоматические лимиты через Linux powercap (Intel RAPL)."""
 
     mode = "auto"
+    mt_only = False
 
     def __init__(self, root: Path = POWERCAP, vendor: str = "GenuineIntel") -> None:
         self.root = root
@@ -200,6 +214,7 @@ class ManualLimiter:
     """Лимит выставляет пользователь (Windows: ThrottleStop / Intel XTU)."""
 
     mode = "manual"
+    mt_only = False
     TOOLS = "ThrottleStop (TPL) или Intel XTU"
 
     def __init__(self, ask=None) -> None:
@@ -234,6 +249,222 @@ class ManualLimiter:
         return []
 
 
+# --------------------------------------------------------------------------
+#  Windows: эмуляция лимита потолком частоты
+# --------------------------------------------------------------------------
+
+FREQ_SETTINGS = ("PROCFREQMAX", "PROCFREQMAX1")  # класс эффективности 0 и 1 (E и P)
+MIN_CAP, MAX_CAP = 800, 6000  # МГц; 0 = без ограничения
+CAP_STEP = 50
+CAL_TOL = 0.04       # ступень найдена, если мощность в пределах ±4 %
+CAL_SKIP_TOL = 0.10  # на минимальном потолке мощность выше цели на 10 % -> ступень недостижима
+CAL_ITERS = 10
+# P ~ f^0.8 в рабочем диапазоне (замер на Core Ultra 9 185H): шаг регулятора
+# cap_new = cap * (target / P) ^ (1 / 0.8)
+CAL_GAIN = 1.25
+
+
+def _quantize(mhz: float) -> int:
+    return int(min(MAX_CAP, max(MIN_CAP, round(mhz / CAP_STEP) * CAP_STEP)))
+
+
+def initial_cap(target: float, history: list[tuple[int, float]]) -> int:
+    """Стартовый потолок для ступени по уже найденным точкам (потолок, Вт)."""
+    pts = sorted((c, p) for c, p in history if c > 0 and p > 0)
+    if not pts:
+        return 2000
+    # ближайшая точка + та же степенная модель
+    c, p = min(pts, key=lambda cp: abs(cp[1] - target))
+    return _quantize(c * (target / p) ** CAL_GAIN)
+
+
+def calibrate(target: float, set_cap, measure, start_cap: int,
+              max_power: float | None = None) -> tuple[int, float, str]:
+    """Подбирает потолок частоты, при котором мощность пакета ≈ target.
+
+    set_cap(МГц) выставляет потолок (0 — без ограничения), measure() ждёт
+    и возвращает среднюю мощность пакета, Вт. max_power — мощность без
+    потолка, если уже известна. Возвращает (потолок, мощность, статус):
+    "ok" — найдено; "above_max" — цель выше мощности без ограничения
+    (потолок 0); "below_min" — даже на минимальном потолке мощность выше цели.
+
+    Мощность без потолка гуляет (схема питания, EC, нагрев), поэтому
+    max_power — только подсказка: «потолок не нужен» засчитывается лишь
+    после замера без потолка прямо сейчас."""
+    if max_power is not None and target >= max_power * (1 - CAL_TOL):
+        set_cap(0)
+        p0 = measure()
+        if p0 is not None and p0 < target * (1 + CAL_TOL):
+            return 0, p0, "above_max"
+        # максимум был занижен — ищем потолок как обычно
+    cap = _quantize(start_cap)
+    best: tuple[float, int, float] | None = None
+    for _ in range(CAL_ITERS):
+        set_cap(cap)
+        p = measure()
+        if p is None or p <= 0:
+            raise LimitError("нет данных о мощности пакета (RAPL) для подбора потолка")
+        err = abs(p / target - 1)
+        if best is None or err < best[0]:
+            best = (err, cap, p)
+        if err <= CAL_TOL:
+            return cap, p, "ok"
+        if p > target and cap <= MIN_CAP:
+            return (cap, p, "below_min") if p > target * (1 + CAL_SKIP_TOL) else (cap, p, "ok")
+        if p < target and cap >= MAX_CAP:
+            set_cap(0)
+            return 0, measure(), "above_max"
+        nxt = _quantize(cap * (target / p) ** CAL_GAIN)
+        if nxt == cap:  # упёрлись в шаг квантования
+            break
+        cap = nxt
+    _err, cap, p = best  # type: ignore[misc]
+    set_cap(cap)
+    return cap, p, "ok"
+
+
+def _powercfg(*args: str) -> str:
+    r = subprocess.run(["powercfg", *args], capture_output=True, timeout=30)
+    out = r.stdout.decode("cp866", "replace")
+    if r.returncode != 0:
+        raise LimitError(f"powercfg {' '.join(args)}: код {r.returncode}")
+    return out
+
+
+def read_freq_caps(run=_powercfg) -> dict[str, tuple[int, int]]:
+    """{"PROCFREQMAX": (AC, DC), ...} активной схемы, МГц (0 — без ограничения).
+
+    Параметры скрытые, поэтому /qh. Текст ответа зависит от языка Windows,
+    но значения AC и DC — всегда два последних числа 0x........ в нём."""
+    caps = {}
+    for name in FREQ_SETTINGS:
+        vals = re.findall(r"0x[0-9a-fA-F]{8}", run("/qh", "SCHEME_CURRENT", "SUB_PROCESSOR", name))
+        if len(vals) < 2:
+            raise LimitError(f"powercfg не вернул значения {name}")
+        caps[name] = (int(vals[-2], 16), int(vals[-1], 16))
+    return caps
+
+
+class FreqCapLimiter:
+    """Windows: эмуляция PL1 потолком частоты, подобранным под нагрузкой."""
+
+    mode = "freqcap"
+    mt_only = True
+    SETTLE_S = 1.0    # после смены потолка
+    step_overhead_s = 15.0  # примерное время подбора потолка на ступень
+    MEASURE_S = 1.5   # окно усреднения мощности
+    WARMUP_S = 2.0    # прогрев нагрузки перед первым замером максимума
+
+    def __init__(self, reader=None, run=_powercfg) -> None:
+        self.reader = reader
+        self._run = run
+        self._saved: dict[str, tuple[int, int]] = {}
+        self._applied: int | None = None
+        self.history: list[tuple[int, float]] = []
+        self.max_power: float | None = None
+        self.last_note: str | None = None
+        self._exe = None
+        self._sampler = None
+        self._threads = 0
+        self._problem: str | None = None
+        try:
+            read_freq_caps(run)
+        except (LimitError, OSError, subprocess.SubprocessError) as exc:
+            self._problem = f"не удалось прочитать настройки плана электропитания ({exc})"
+
+    def problem(self) -> str | None:
+        if self._problem:
+            return self._problem
+        if self.reader is not None and self.reader.kind() != "pkg":
+            return "для подбора лимита нужен датчик мощности пакета (RAPL / Energy Meter)"
+        return None
+
+    def describe(self) -> str:
+        return ("автоматически: эмуляция PL1 потолком частоты Windows "
+                "(PROCFREQMAX), подбор под нагрузкой; только многопоток")
+
+    def attach(self, exe, sampler, threads: int) -> None:
+        """Нагрузка и датчики для подбора потолка (известны только после сборки bench)."""
+        self._exe, self._sampler, self._threads = exe, sampler, threads
+
+    def save(self) -> None:
+        self._saved = read_freq_caps(self._run)
+
+    def saved_lines(self) -> list[str]:
+        def fmt(v: int) -> str:
+            return "без ограничения" if v == 0 else f"{v} МГц"
+        return [f"{name}: сеть {fmt(ac)}, батарея {fmt(dc)}"
+                for name, (ac, dc) in self._saved.items()]
+
+    def _set(self, mhz: int) -> None:
+        for name in FREQ_SETTINGS:
+            for idx in ("/setacvalueindex", "/setdcvalueindex"):
+                self._run(idx, "SCHEME_CURRENT", "SUB_PROCESSOR", name, str(mhz))
+        self._run("/setactive", "SCHEME_CURRENT")
+        self._applied = mhz
+
+    def _measure(self) -> float | None:
+        from ppwbench import core  # здесь, чтобы powerlimit не тянул core при импорте
+        time.sleep(self.SETTLE_S)
+        t0 = time.perf_counter()
+        time.sleep(self.MEASURE_S)
+        window = [s for s in self._sampler.samples if s["t"] >= t0]
+        return core.window_power(window, "pkg")
+
+    def apply(self, watts: float) -> float:
+        if self._exe is None or self._sampler is None:
+            raise LimitError("подбор потолка не подключён к нагрузке (attach)")
+        print(f"     подбор потолка частоты под {watts:g} Вт ...", flush=True)
+        proc = subprocess.Popen([str(self._exe), str(self._threads), "600"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            if self.max_power is None:
+                self._set(0)
+                time.sleep(self.WARMUP_S)  # нагрузка только что стартовала
+                self.max_power = self._measure()
+            cap, power, status = calibrate(watts, self._set, self._measure,
+                                           initial_cap(watts, self.history), self.max_power)
+        finally:
+            proc.kill()
+            proc.wait()
+        if cap > 0:
+            self.history.append((cap, power))
+        elif power:
+            self.max_power = power  # свежий замер без потолка
+        if status == "below_min":
+            self._set(0)  # не держим минимальный потолок до следующей ступени
+            raise StepSkipped(f"ниже минимума: даже на {cap} МГц пакет берёт {power:.1f} Вт")
+        if status == "above_max":
+            self.last_note = f"без потолка (максимум ~{power:.1f} Вт)"
+        else:
+            self.last_note = f"потолок {cap} МГц (~{power:.1f} Вт при подборе)"
+        print(f"     {self.last_note}", flush=True)
+        return watts
+
+    def verify(self) -> list[str]:
+        if self._applied is None:
+            return []
+        try:
+            caps = read_freq_caps(self._run)
+        except LimitError as exc:
+            return [str(exc)]
+        return [f"{name}: {self._applied} → {ac} МГц"
+                for name, (ac, _dc) in caps.items() if ac != self._applied]
+
+    def restore(self) -> list[str]:
+        if not self._saved:
+            return []
+        errors = []
+        try:
+            for name, (ac, dc) in self._saved.items():
+                self._run("/setacvalueindex", "SCHEME_CURRENT", "SUB_PROCESSOR", name, str(ac))
+                self._run("/setdcvalueindex", "SCHEME_CURRENT", "SUB_PROCESSOR", name, str(dc))
+            self._run("/setactive", "SCHEME_CURRENT")
+        except (LimitError, OSError, subprocess.SubprocessError) as exc:
+            errors.append(str(exc))
+        return errors
+
+
 def limit_held(target_w: float, power_w: float | None) -> bool | None:
     """Соблюдён ли лимит: средняя мощность пакета не выше цели (+10 % и 0.5 Вт допуска)."""
     if power_w is None:
@@ -241,8 +472,14 @@ def limit_held(target_w: float, power_w: float | None) -> bool | None:
     return power_w <= target_w * 1.10 + 0.5
 
 
-def for_backend(backend):
-    """Подходящий ограничитель для платформы."""
+SWEEP_MODES = ("auto", "manual")
+
+
+def for_backend(backend, reader=None, mode: str = "auto"):
+    """Ограничитель для платформы: auto — Linux powercap или Windows потолок
+    частоты; manual — пользователь выставляет лимит сам (ThrottleStop / XTU)."""
+    if mode == "manual":
+        return ManualLimiter()
     if backend.NAME == "Linux":
         return PowercapLimiter(backend.SYSFS / "class/powercap", backend.cpu_vendor())
-    return ManualLimiter()
+    return FreqCapLimiter(reader)

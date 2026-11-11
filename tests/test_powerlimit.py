@@ -190,3 +190,168 @@ def test_manual_limiter_without_console():
     warnings: list[str] = []
     assert cli.run_sweep(lim, [10], 0, lambda: [], warnings) == []
     assert "нужна консоль" in warnings[0]
+
+
+# --- Windows: эмуляция лимита потолком частоты -------------------------------
+
+def _model(cap):
+    """Похоже на Core Ultra 9 185H: ~30 Вт без потолка, пол ~14 Вт."""
+    if cap == 0:
+        return 30.0
+    return max(14.0, min(30.0, 30.0 * (cap / 3300) ** 1.2))
+
+
+class FakeCPU:
+    def __init__(self):
+        self.cap = 0
+        self.calls = 0
+
+    def set_cap(self, mhz):
+        self.cap = mhz
+
+    def measure(self):
+        self.calls += 1
+        return _model(self.cap)
+
+
+@pytest.mark.parametrize("target", [16, 20, 25])
+def test_calibrate_converges(target):
+    cpu = FakeCPU()
+    cap, power, status = powerlimit.calibrate(target, cpu.set_cap, cpu.measure, 2000, 30.0)
+    assert status == "ok" and abs(power / target - 1) <= 0.05
+    assert cpu.cap == cap and cpu.calls <= 6
+
+
+def test_calibrate_below_min_and_above_max():
+    cpu = FakeCPU()
+    assert powerlimit.calibrate(8, cpu.set_cap, cpu.measure, 2000, 30.0)[2] == "below_min"
+    cpu = FakeCPU()
+    cap, power, status = powerlimit.calibrate(45, cpu.set_cap, cpu.measure, 2000, 30.0)
+    assert (cap, status) == (0, "above_max") and cpu.cap == 0
+
+
+def test_initial_cap_uses_history():
+    assert powerlimit.initial_cap(20, []) == 2000
+    start = powerlimit.initial_cap(20, [(0, 30.0), (2200, 18.4)])
+    assert 2200 < start < 2600
+
+
+POWERCFG_QH = """GUID схемы питания: a1841308-...  (Экономия энергии)
+  Псевдоним GUID: SCHEME_MAX
+    GUID параметра питания: 75b0ae3f-bce0-45a7-8c89-c9611c25e100  (Максимальная частота процессора)
+      Псевдоним GUID: PROCFREQMAX
+      Минимальное возможное значение: 0x00000000
+      Максимальное возможное значение: 0xffffffff
+      Возможное приращение: 0x00000001
+    Текущий индекс параметра питания от сети: 0x{ac:08x}
+    Текущий индекс параметра питания от батареи: 0x{dc:08x}
+"""
+
+
+class FakePowercfg:
+    def __init__(self, ac=0, dc=3700):
+        self.vals = {name: [ac, dc] for name in powerlimit.FREQ_SETTINGS}
+        self.activations = 0
+
+    def __call__(self, *args):
+        if args[0] == "/qh":
+            ac, dc = self.vals[args[3]]
+            return POWERCFG_QH.format(ac=ac, dc=dc)
+        if args[0] in ("/setacvalueindex", "/setdcvalueindex"):
+            self.vals[args[3]][0 if args[0] == "/setacvalueindex" else 1] = int(args[4])
+        elif args[0] == "/setactive":
+            self.activations += 1
+        return ""
+
+
+def test_read_freq_caps_parses_last_two_values():
+    caps = powerlimit.read_freq_caps(FakePowercfg(ac=0, dc=3700))
+    assert caps == {"PROCFREQMAX": (0, 3700), "PROCFREQMAX1": (0, 3700)}
+
+
+def test_freqcap_limiter_save_set_verify_restore():
+    pc = FakePowercfg(ac=0, dc=3700)
+    lim = powerlimit.FreqCapLimiter(run=pc)
+    assert lim.problem() is None and lim.mt_only
+    lim.save()
+    lim._set(1650)
+    assert pc.vals["PROCFREQMAX"] == [1650, 1650] and pc.activations == 1
+    assert lim.verify() == []
+    pc.vals["PROCFREQMAX1"][0] = 2000  # кто-то поменял план
+    assert lim.verify() == ["PROCFREQMAX1: 1650 → 2000 МГц"]
+    assert lim.restore() == []
+    assert pc.vals == {"PROCFREQMAX": [0, 3700], "PROCFREQMAX1": [0, 3700]}
+
+
+def test_freqcap_limiter_reports_broken_powercfg():
+    def broken(*_args):
+        raise powerlimit.LimitError("нет powercfg")
+
+    assert "плана электропитания" in powerlimit.FreqCapLimiter(run=broken).problem()
+
+
+def test_run_sweep_skips_unreachable_step():
+    class Lim(powerlimit.ManualLimiter):
+        mode = "freqcap"
+
+        def apply(self, watts):
+            if watts < 14:
+                raise powerlimit.StepSkipped("ниже минимума")
+            self.last_note = f"потолок {int(watts * 100)} МГц"
+            return watts
+
+        def restore(self):
+            return []
+
+    warnings: list[str] = []
+    steps = cli.run_sweep(Lim(), [8, 20], 0, lambda: [_phase(8, 2e9, 19.5)], warnings)
+    assert steps[0]["skipped"] == "ниже минимума" and steps[0]["phases"] == []
+    assert steps[1]["note"] == "потолок 2000 МГц"
+    meta = {"date": "d", "cpu": "c", "cores": 4, "threads": 8, "os": "o", "power": "p",
+            "duration": 20, "warmup": 8, "warnings": warnings}
+    text = report.build_sweep_report(meta, steps, "src")
+    assert "8 Вт    пропущена: ниже минимума" in text
+    assert "20 Вт → потолок 2000 МГц" in text
+    rows = report.sweep_rows(steps)
+    assert rows[0]["note"] == "skipped: ниже минимума" and rows[1]["note"] == "потолок 2000 МГц"
+
+
+def test_menu_offers_auto_or_manual(monkeypatch):
+    class Auto:
+        mode, mt_only, TOOLS = "freqcap", True, ""
+
+        def problem(self):
+            return None
+
+        def describe(self):
+            return "auto"
+
+    manual = powerlimit.ManualLimiter()
+    answers = iter(["1", "1", "2", "2"])  # весь CPU, 20 с, стандартные ступени, вручную
+    monkeypatch.setattr("builtins.input", lambda _p="": next(answers))
+    res = cli.interactive_menu(object(), {"p": [0], "e": [1]}, 10, Auto(), 0, manual)
+    assert res["limiter"] is manual and res["sweep"] == list(powerlimit.DEFAULT_STEPS)
+
+
+def test_menu_st_only_falls_back_to_manual(monkeypatch):
+    class Auto:
+        mode, mt_only = "freqcap", True
+
+        def problem(self):
+            return None
+
+        def describe(self):
+            return "auto"
+
+    manual = powerlimit.ManualLimiter()
+    answers = iter(["3", "1", "2"])  # только однопоток, 20 с, стандартные ступени
+    monkeypatch.setattr("builtins.input", lambda _p="": next(answers))
+    res = cli.interactive_menu(object(), {"p": [0], "e": [1]}, 10, Auto(), 0, manual)
+    assert res["limiter"] is manual
+
+
+def test_calibrate_does_not_trust_low_max_power():
+    # максимум занижен (замер в первую секунду): 25 Вт всё равно надо искать потолком
+    cpu = FakeCPU()
+    cap, power, status = powerlimit.calibrate(25, cpu.set_cap, cpu.measure, 2000, max_power=24.0)
+    assert status == "ok" and cap > 0 and abs(power / 25 - 1) <= 0.05

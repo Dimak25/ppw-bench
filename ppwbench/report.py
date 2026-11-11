@@ -73,6 +73,10 @@ def build_sweep_report(meta: dict, steps: list[dict], source: str) -> str:
                  f"{'PPW':<19}{'Частота'}")
         flagged = False
         for st in steps:
+            if st.get("skipped"):
+                limit = f"{st['target']:g} Вт"
+                L.append(f"  {limit:<8}пропущена: {st['skipped']}")
+                continue
             first = True
             for ph in st["phases"]:
                 limit = f"{st['target']:g} Вт" if first else ""
@@ -90,6 +94,10 @@ def build_sweep_report(meta: dict, steps: list[dict], source: str) -> str:
         if flagged:
             L.append("  ! — средняя мощность пакета выше лимита больше чем на 10 %:")
             L.append("      лимит фактически не соблюдался (BIOS, EC или другая программа).")
+        notes = [f"{st['target']:g} Вт → {st['note']}" for st in steps if st.get("note")]
+        if notes:
+            L.append("  Как выставлен лимит:")
+            L.extend(f"    {n}" for n in notes)
     L.append(DASH)
 
     L.append("ЛУЧШИЙ PPW")
@@ -114,12 +122,17 @@ def build_sweep_report(meta: dict, steps: list[dict], source: str) -> str:
 
 
 SWEEP_CSV_FIELDS = ("limit_w", "applied_w", "phase", "threads", "work_per_s",
-                    "power_w", "pkg_w", "ppw", "freq_mhz", "limit_held")
+                    "power_w", "pkg_w", "ppw", "freq_mhz", "limit_held", "note")
 
 
 def sweep_rows(steps: list[dict]) -> list[dict]:
     rows = []
     for st in steps:
+        if st.get("skipped"):
+            row = dict.fromkeys(SWEEP_CSV_FIELDS, "")
+            row.update(limit_w=f"{st['target']:g}", note=f"skipped: {st['skipped']}")
+            rows.append(row)
+            continue
         for ph in st["phases"]:
             freq = ph.get("freq") or {}
             held = ph.get("limit_held")
@@ -134,6 +147,7 @@ def sweep_rows(steps: list[dict]) -> list[dict]:
                 "ppw": f"{ph['ppw']:.0f}" if ph.get("ppw") else "",
                 "freq_mhz": f"{freq['mhz']:.0f}" if freq.get("mhz") else "",
                 "limit_held": "" if held is None else ("yes" if held else "no"),
+                "note": st.get("note") or "",
             })
     return rows
 

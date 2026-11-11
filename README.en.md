@@ -165,7 +165,8 @@ With no arguments a two-step interactive menu opens:
 2. **Seconds per phase:** 20, 60 or 120 s — the same for every phase. The
    phase count and estimated total time are shown next to each option.
 3. **Power sweep:** no, the default 5–45 W steps, or your own (see
-   [below](#power-sweep)).
+   [below](#power-sweep)). On Windows, step 4 then picks automatic or manual
+   limits.
 
 After the test the app asks whether to save the `.txt` report and keeps the
 window open.
@@ -182,6 +183,7 @@ window open.
 | `--repeat N` | run each phase N times; the report shows medians and the run-to-run spread |
 | `--watts N` | use a fixed CPU wattage (no sensors available) |
 | `--sweep W,W,...` | power sweep: run the phases at each power limit, e.g. `5,8,10,15,20,28,35,45` |
+| `--sweep-mode MODE` | how to set the limit: `auto` (Linux powercap; Windows — frequency cap, multi-thread only) or `manual` (ThrottleStop / XTU) |
 | `--settle N` | pause after each limit change, s (default 10) |
 | `--out FILE` | report path (default `ppw-report-*.txt`) |
 | `--list` | list detected sensors and exit |
@@ -237,8 +239,22 @@ sudo ./ppw-bench --sweep 5,8,10,15,20,28,35,45 --duration 30 --no-st
   (`intel-rapl` and `intel-rapl-mmio` when both exist). Requires root. The
   original limits are saved and restored afterwards — also on errors, Ctrl+C
   and a closed terminal.
-* **Windows** — there is no public API for PL1: before each step the app asks
-  you to set the limit in ThrottleStop or Intel XTU and press Enter.
+* **Windows, auto mode** (default) — there is no public API for PL1, so the
+  limit is **emulated with the power plan's frequency cap**
+  (`PROCFREQMAX` / `PROCFREQMAX1`). At each step the app runs a load and,
+  within 10–15 s, finds the cap at which package power equals the step. The
+  CPU lowers both frequency and voltage, as with a real PL1, but the frequency
+  is set by the cap rather than by firmware; the report says so.
+  Limitations:
+  * **multi-thread only** — a single-thread load is not limited by the cap,
+    so single-thread phases are left out of the sweep;
+  * power has a floor (~14 W on a Core Ultra 9 185H): lower steps are marked
+    "skipped";
+  * needs the package RAPL sensor (Energy Meter); no admin rights required.
+  The original power plan values are restored afterwards.
+* **Windows, manual mode** (`--sweep-mode manual` or step 4 of the menu) —
+  before each step the app asks you to set the limit in ThrottleStop or
+  Intel XTU and press Enter. Use it for single-thread and below the floor.
 * **AMD** — not supported yet (limits are set via `ryzenadj`).
 * If the average package power of a step exceeds the limit by more than 10 %,
   the row is marked `!`: the limit was not actually enforced (BIOS lock, EC,
