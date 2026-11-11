@@ -27,7 +27,7 @@ def run_menu(monkeypatch, answers, tiers=MTL):
 
 def test_defaults_whole_cpu_60s(monkeypatch):
     res = run_menu(monkeypatch, ["", ""])
-    assert res == {"suite": "cpu", "duration": 60.0, "pin": "all",
+    assert res == {"suite": "cpu", "duration": 60.0, "sweep": None, "limiter": None, "pin": "all",
                    "no_st": False, "only_st": False}
 
 

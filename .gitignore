@@ -9,6 +9,7 @@ dist/
 
 # Результаты тестов (у каждого свои)
 ppw-report-*.txt
+ppw-report-*.csv
 ci-report.txt
 results/
 *.log

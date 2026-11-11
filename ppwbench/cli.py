@@ -7,20 +7,25 @@
     ppw-bench --threads 8 --no-st   # только MT на 8 потоках
     ppw-bench --watts 45            # если датчиков нет: задать мощность вручную
     ppw-bench --list                # показать найденные датчики и выйти
+    sudo ppw-bench --sweep 5,10,15,25 --duration 30   # PPW на разных лимитах (Linux)
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import platform
+import signal
+import time
 from datetime import datetime
 
-from ppwbench import __version__, core, report, util
+from ppwbench import __version__, core, powerlimit, report, util
 from ppwbench.cpusets import TIER_NAMES, TIER_ORDER, format_cpulist, parse_cpulist
 from ppwbench.platforms import current as current_backend
 from ppwbench.util import fmt_si
 
 DEFAULT_COOLDOWN = 10.0
+DEFAULT_SETTLE = 10.0
 
 
 def print_sensors(reader) -> None:
@@ -53,6 +58,12 @@ def estimate_seconds(phases: int, duration: float, cooldown: float) -> float:
     return (duration + 3) * phases + cooldown * max(phases - 1, 0)
 
 
+def sweep_seconds(steps: int, phases: int, duration: float, cooldown: float,
+                  settle: float = DEFAULT_SETTLE) -> float:
+    """Время ступенчатого замера: на каждой ступени пауза settle + все фазы."""
+    return steps * (settle + estimate_seconds(phases, duration, cooldown))
+
+
 def _fmt_total(seconds: float) -> str:
     minutes = seconds / 60
     return f"~{seconds:.0f} с" if minutes < 1.5 else f"~{minutes:.0f} мин"
@@ -65,12 +76,88 @@ def _st_desc(tiers: dict[str, list[int]] | None) -> str:
     return f"однопоток на {names}-ядрах"
 
 
-def interactive_menu(reader, tiers: dict[str, list[int]] | None,
-                     cooldown: float = DEFAULT_COOLDOWN) -> dict | None:
-    """Интерактивное меню в два шага: какой набор тестов и сколько секунд на фазу.
+def _sweep_cost(limiter, phases: int, has_st: bool) -> tuple[int, float]:
+    """(фаз на ступень, доп. секунд на ступень) для оценки времени замера."""
+    if getattr(limiter, "mt_only", False) and has_st:
+        phases = 1
+    return phases, getattr(limiter, "step_overhead_s", 0.0)
 
-    Возвращает {"suite", "duration", "pin", "no_st", "only_st"} либо None (выход).
-    На гибридных CPU однопоточная фаза идёт отдельно на каждом типе ядер."""
+
+def _ask_sweep(limiter, phases: int, duration: float, cooldown: float,
+               settle: float = DEFAULT_SETTLE, manual=None,
+               has_mt: bool = True, has_st: bool = False):
+    """Шаги 3–4 меню: ступени и (если есть выбор) способ выставлять лимит.
+
+    Возвращает (ступени, ограничитель), None (без замера) или "back".
+    manual — запасной ручной ограничитель (Windows: ThrottleStop / XTU)."""
+    auto = limiter
+    reason = limiter.problem()
+    if not reason and getattr(limiter, "mt_only", False) and not has_mt:
+        reason = "авто-режим ограничивает только многопоток"
+    if reason:
+        if manual is None:
+            print(f"Ступенчатый замер мощности недоступен: {reason}.")
+            print()
+            return None
+        auto = None
+        limiter = manual
+    default = list(powerlimit.DEFAULT_STEPS)
+    n_ph, extra = _sweep_cost(limiter, phases, has_st)
+    total = _fmt_total(sweep_seconds(len(default), n_ph, duration, cooldown, settle + extra))
+    print("Шаг 3. Ступенчатый замер мощности (PPW на разных лимитах)?")
+    if auto is not None and manual is not None:
+        print(f"   Лимиты: {auto.describe()}; или вручную ({manual.TOOLS})")
+    else:
+        print(f"   Лимиты: {limiter.describe()}")
+        if reason:
+            print(f"   (автоматически нельзя: {reason})")
+    print("  1. Нет")
+    print(f"  2. Да: {powerlimit.fmt_steps(default)}  (всего {total})")
+    print("  3. Да, свои ступени")
+    print("  0. Назад")
+    choice = util.ask_choice("Выбор [1]: ", {"0", "1", "2", "3"}, "1")
+    print()
+    if choice == "0":
+        return "back"
+    if choice == "1":
+        return None
+    steps = default
+    while choice == "3":
+        try:
+            raw = input("Ступени в ваттах через запятую (например 10,15,25): ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        try:
+            steps = powerlimit.parse_steps(raw)
+        except ValueError as exc:
+            print(f"Ошибка: {exc}")
+            continue
+        total = _fmt_total(sweep_seconds(len(steps), n_ph, duration, cooldown, settle + extra))
+        print(f"Ступени: {powerlimit.fmt_steps(steps)}, всего {total}")
+        print()
+        break
+    if auto is not None and manual is not None:
+        print("Шаг 4. Как выставлять лимит?")
+        print(f"  1. Автоматически — {auto.describe()}")
+        print(f"  2. Вручную       — {manual.describe()}")
+        if getattr(auto, "mt_only", False) and has_st:
+            print("     (в авто-режиме однопоточные фазы в замер не входят)")
+        mode = util.ask_choice("Выбор [1]: ", {"1", "2"}, "1")
+        print()
+        limiter = auto if mode == "1" else manual
+    return steps, limiter
+
+
+def interactive_menu(reader, tiers: dict[str, list[int]] | None,
+                     cooldown: float = DEFAULT_COOLDOWN, limiter=None,
+                     settle: float = DEFAULT_SETTLE, manual=None) -> dict | None:
+    """Интерактивное меню: какой набор тестов, сколько секунд на фазу и (если
+    передан limiter) нужен ли ступенчатый замер мощности и как ставить лимит.
+
+    Возвращает {"suite", "duration", "pin", "no_st", "only_st", "sweep",
+    "limiter"} либо None (выход). На гибридных CPU однопоточная фаза идёт на
+    каждом типе ядер."""
     st_desc = _st_desc(tiers)
     descs = {
         "cpu": f"многопоток + {st_desc}",
@@ -108,10 +195,21 @@ def interactive_menu(reader, tiers: dict[str, list[int]] | None,
         print()
         if dchoice == "0":
             continue
+        duration = MENU_DURATIONS[int(dchoice) - 1]
         _label, mt, st = SUITES[suite]
+        sweep, chosen_limiter = None, limiter
+        if limiter is not None:
+            ans = _ask_sweep(limiter, phases, duration, cooldown, settle, manual,
+                             has_mt=mt, has_st=st)
+            if ans == "back":
+                continue
+            if ans:
+                sweep, chosen_limiter = ans
         return {
             "suite": suite,
-            "duration": MENU_DURATIONS[int(dchoice) - 1],
+            "duration": duration,
+            "sweep": sweep,
+            "limiter": chosen_limiter,
             "pin": "all" if st and tiers else "auto",
             "no_st": not st,
             "only_st": not mt,
@@ -183,6 +281,37 @@ def resolve_pin(mode: str, backend) -> tuple[list[int] | None, str, list[str]]:
     return phases[0]["cpus"], phases[0]["label"], warns
 
 
+def sweep_arg(value: str) -> list[float]:
+    try:
+        return powerlimit.parse_steps(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
+@contextlib.contextmanager
+def exit_on_signals():
+    """SIGTERM / SIGHUP (закрыли терминал, kill) -> SystemExit, чтобы сработали
+    finally-блоки и лимиты мощности вернулись к исходным."""
+    old = {}
+
+    def handler(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            old[sig] = signal.signal(sig, handler)
+        except (ValueError, OSError):
+            pass
+    try:
+        yield
+    finally:
+        for sig, h in old.items():
+            signal.signal(sig, h)
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="ppw-bench",
@@ -205,11 +334,76 @@ def build_parser() -> argparse.ArgumentParser:
                     help="повторить каждую фазу N раз; в отчёте медианы и разброс")
     ap.add_argument("--watts", type=float, default=None,
                     help="задать мощность CPU вручную (если датчики недоступны)")
+    ap.add_argument("--sweep", type=sweep_arg, default=None, metavar="W,W,...",
+                    help="ступенчатый замер: прогнать фазы на каждом лимите мощности "
+                         "(PL1 = PL2), например 5,8,10,15,20,28,35,45. Linux (Intel): "
+                         "лимиты выставляются сами (нужен root); Windows: потолком частоты "
+                         "или вручную, см. --sweep-mode")
+    ap.add_argument("--sweep-mode", choices=powerlimit.SWEEP_MODES, default="auto",
+                    help="как выставлять лимит: auto — сам (Linux powercap; Windows — "
+                         "потолок частоты, только многопоток), manual — вручную "
+                         "(ThrottleStop / XTU)")
+    ap.add_argument("--settle", type=float, default=DEFAULT_SETTLE,
+                    help="пауза после смены лимита перед фазами, с")
     ap.add_argument("--out", type=str, default=None, help="путь к .txt-отчёту")
     ap.add_argument("--list", action="store_true", help="показать датчики и выйти")
     ap.add_argument("--interactive", action="store_true", help="запустить интерактивное меню")
     ap.add_argument("--version", action="version", version=f"ppw-bench {__version__}")
     return ap
+
+
+def run_sweep(limiter, steps: list[float], settle: float, run_plan, warnings: list[str]) -> list[dict]:
+    """Прогоняет run_plan() на каждой ступени лимита мощности.
+
+    Исходные лимиты возвращаются в любом случае: при ошибке, Ctrl+C, SIGTERM.
+    Если лимит не принят (заблокирован в BIOS и т.п.), замер останавливается,
+    а уже снятые ступени остаются в отчёте. Недостижимая ступень (StepSkipped)
+    попадает в отчёт как пропущенная, замер идёт дальше."""
+    limiter.save()
+    for line in limiter.saved_lines():
+        print(f"Исходный лимит {line} — будет возвращён после замера")
+    done: list[dict] = []
+    try:
+        with exit_on_signals():
+            for i, watts in enumerate(steps):
+                print()
+                print(f"=== Ступень {i + 1}/{len(steps)}: {watts:g} Вт ===", flush=True)
+                limiter.last_note = None
+                try:
+                    applied = limiter.apply(watts)
+                except powerlimit.StepSkipped as exc:
+                    print(f"  ! Ступень {watts:g} Вт пропущена: {exc}")
+                    done.append({"target": watts, "applied": None, "phases": [],
+                                 "changed": [], "skipped": str(exc)})
+                    continue
+                except powerlimit.LimitError as exc:
+                    msg = f"Ступенчатый замер остановлен на {watts:g} Вт: {exc}"
+                    print(f"  ! {msg}")
+                    warnings.append(msg)
+                    break
+                if settle > 0:
+                    print(f"     пауза {settle:.0f} с на новом лимите ...", flush=True)
+                    time.sleep(settle)
+                phases = run_plan()
+                changed = limiter.verify()
+                for c in changed:
+                    msg = f"Ступень {watts:g} Вт: лимит изменила другая программа: {c}"
+                    print(f"  ! {msg}")
+                    warnings.append(msg)
+                for ph in phases:
+                    ph["limit_held"] = powerlimit.limit_held(watts, ph.get("pkg_w"))
+                done.append({"target": watts, "applied": applied, "phases": phases,
+                             "changed": changed, "note": limiter.last_note})
+    finally:
+        errors = limiter.restore()
+        if errors:
+            for e in errors:
+                print(f"  !!! Не удалось вернуть лимит: {e}")
+            warnings.append("Исходные лимиты вернуть не удалось — проверьте их вручную "
+                            "или перезагрузитесь.")
+        elif limiter.mode != "manual":
+            print("Исходные лимиты мощности возвращены.")
+    return done
 
 
 def main() -> int:
@@ -224,24 +418,44 @@ def main() -> int:
         ap.error("--cooldown не может быть отрицательным")
     if not 1 <= args.repeat <= 20:
         ap.error("--repeat должен быть от 1 до 20")
+    if args.settle < 0:
+        ap.error("--settle не может быть отрицательным")
 
     reader = backend.PowerReader()
     reader.prime()
     pin_mode = args.pin
+    limiter = powerlimit.for_backend(backend, reader, args.sweep_mode)
+    # Windows: если авто-режим не подходит, лимит можно выставить вручную
+    manual_alt = (powerlimit.ManualLimiter()
+                  if backend.NAME == "Windows" and limiter.mode != "manual" else None)
+    sweep = args.sweep
     if interactive:
-        chosen = interactive_menu(reader, backend.core_types(), args.cooldown)
+        chosen = interactive_menu(reader, backend.core_types(), args.cooldown, limiter,
+                                  args.settle, manual_alt)
         if chosen is None:
             return 0
         duration = chosen["duration"]
         pin_mode = chosen["pin"]
         args.no_st = chosen["no_st"]
         args.only_st = chosen["only_st"]
+        sweep = chosen["sweep"]
+        limiter = chosen["limiter"] or limiter
     else:
         if duration < 8:
             ap.error("--duration должен быть >= 8 секунд")
         if args.list:
             print_sensors(reader)
             return 0
+        if sweep:
+            problem = limiter.problem()
+            if problem:
+                ap.error(f"--sweep: {problem}")
+            if limiter.mode == "manual" and not util.stdin_is_tty():
+                ap.error("--sweep: на этой платформе лимит выставляется вручную, "
+                         "нужен интерактивный терминал")
+            if getattr(limiter, "mt_only", False) and args.only_st:
+                ap.error("--sweep: авто-режим ограничивает только многопоток; "
+                         "для однопотока добавьте --sweep-mode manual")
 
     logical = backend.logical_cpus()
     mt_threads = args.threads if args.threads > 0 else logical
@@ -277,6 +491,14 @@ def main() -> int:
                             "label": None, "core_kind": None})
     if not args.no_st:
         phases_spec += [dict(ph, threads=1) for ph in st_phases]
+    if sweep and getattr(limiter, "mt_only", False):
+        dropped = [ph for ph in phases_spec if ph["threads"] == 1]
+        phases_spec = [ph for ph in phases_spec if ph["threads"] > 1]
+        if dropped:
+            warnings.append(
+                "Авто-режим ограничивает только многопоток: однопоточные фазы в "
+                "ступенчатый замер не вошли (для них — --sweep-mode manual)."
+            )
 
     repeat = args.repeat
     plan = [(r, ph) for r in range(repeat) for ph in phases_spec]
@@ -296,8 +518,12 @@ def main() -> int:
         "version": __version__,
         "warnings": warnings,
     }
+    if sweep:
+        meta["sweep"] = limiter.describe()
+        meta["settle"] = args.settle
 
     total_time = estimate_seconds(len(plan), duration, cooldown)
+    step_extra = args.settle + getattr(limiter, "step_overhead_s", 0.0)
     print(f"CPU: {meta['cpu']}  ({meta['cores']} ядер / {meta['threads']} потоков)")
     print(f"Мощность: {source}")
     print(f"Питание: {power_note}; {meta['profile']}")
@@ -307,17 +533,25 @@ def main() -> int:
         f"План: {len(phases_spec)} фаза(ы)"
         + (f" × {repeat} повтора(ов)" if repeat > 1 else "")
         + f" по {duration:.0f} с (прогрев {meta['warmup']:.0f} с), ~{total_time:.0f} с всего"
+        + (f" на ступень; ступени {powerlimit.fmt_steps(sweep)}, всего "
+           f"{_fmt_total(sweep_seconds(len(sweep), len(plan), duration, cooldown, step_extra))}"
+           if sweep else "")
     )
     for ph in phases_spec:
         if ph["threads"] == 1:
             print(f"{ph['tag']}: {ph['label']}")
+    if sweep:
+        print(f"Лимиты: {limiter.describe()}")
     print()
 
     tiers = backend.core_types()
     sampler = core.Sampler(reader)
     sampler.start()
-    runs: dict[str, list[dict]] = {ph["tag"]: [] for ph in phases_spec}
-    try:
+    if sweep and hasattr(limiter, "attach"):
+        limiter.attach(exe, sampler, mt_threads)
+
+    def run_plan() -> list[dict]:
+        runs: dict[str, list[dict]] = {ph["tag"]: [] for ph in phases_spec}
         for idx, (r, ph) in enumerate(plan):
             if idx > 0:
                 core.cooldown(cooldown)
@@ -351,11 +585,20 @@ def main() -> int:
                 + (f"   {freq['mhz'] / 1000:.2f} ГГц" if freq else ""),
                 flush=True,
             )
+        return [core.aggregate_runs(runs[ph["tag"]]) for ph in phases_spec]
+
+    try:
+        if sweep:
+            steps = run_sweep(limiter, sweep, args.settle, run_plan, warnings)
+        else:
+            results = run_plan()
     finally:
         sampler.stop()
-    results = [core.aggregate_runs(runs[ph["tag"]]) for ph in phases_spec]
 
-    text = report.build_report(meta, results, source)
+    if sweep:
+        text = report.build_sweep_report(meta, steps, source)
+    else:
+        text = report.build_report(meta, results, source)
     print()
     print(text)
     print()
@@ -364,6 +607,10 @@ def main() -> int:
     if save:
         out = report.save_report(text, args.out)
         print(f"Отчёт сохранён: {out}")
+        if sweep:
+            csv_path = report.save_sweep_csv(steps, out.with_suffix(".csv"))
+            if csv_path:
+                print(f"Таблица ступеней (CSV): {csv_path}")
     else:
         print("Отчёт не сохранён (остался только в консоли).")
 

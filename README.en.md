@@ -164,6 +164,9 @@ With no arguments a two-step interactive menu opens:
    be shown from here too.
 2. **Seconds per phase:** 20, 60 or 120 s — the same for every phase. The
    phase count and estimated total time are shown next to each option.
+3. **Power sweep:** no, the default 5–45 W steps, or your own (see
+   [below](#power-sweep)). On Windows, step 4 then picks automatic or manual
+   limits.
 
 After the test the app asks whether to save the `.txt` report and keeps the
 window open.
@@ -179,6 +182,9 @@ window open.
 | `--pin MODE` | cores for the single-thread phase: `auto` (default), `p`, `e`, `lpe`, `all` (a separate phase on each core type), `none` or a CPU list (`0,2,4-7`) |
 | `--repeat N` | run each phase N times; the report shows medians and the run-to-run spread |
 | `--watts N` | use a fixed CPU wattage (no sensors available) |
+| `--sweep W,W,...` | power sweep: run the phases at each power limit, e.g. `5,8,10,15,20,28,35,45` |
+| `--sweep-mode MODE` | how to set the limit: `auto` (Linux powercap; Windows — frequency cap, multi-thread only) or `manual` (ThrottleStop / XTU) |
+| `--settle N` | pause after each limit change, s (default 10) |
 | `--out FILE` | report path (default `ppw-report-*.txt`) |
 | `--list` | list detected sensors and exit |
 | `--interactive` | open the interactive menu |
@@ -218,6 +224,46 @@ runs.
 ```bat
 ppw-bench.exe --quick --repeat 3
 ```
+
+### Power sweep
+
+PPW depends heavily on the power limit: at 10 W a CPU is usually far more
+efficient than at 45 W. `--sweep` runs the selected phases at each limit
+step (PL1 = PL2, no boost) and prints a "limit × phase" table.
+
+```bash
+sudo ./ppw-bench --sweep 5,8,10,15,20,28,35,45 --duration 30 --no-st
+```
+
+* **Linux (Intel)** — limits are set automatically through powercap
+  (`intel-rapl` and `intel-rapl-mmio` when both exist). Requires root. The
+  original limits are saved and restored afterwards — also on errors, Ctrl+C
+  and a closed terminal.
+* **Windows, auto mode** (default) — there is no public API for PL1, so the
+  limit is **emulated with the power plan's frequency cap**
+  (`PROCFREQMAX` / `PROCFREQMAX1`). At each step the app runs a load and,
+  within 10–15 s, finds the cap at which package power equals the step. The
+  CPU lowers both frequency and voltage, as with a real PL1, but the frequency
+  is set by the cap rather than by firmware; the report says so.
+  Limitations:
+  * **multi-thread only** — a single-thread load is not limited by the cap,
+    so single-thread phases are left out of the sweep;
+  * power has a floor (~14 W on a Core Ultra 9 185H): lower steps are marked
+    "skipped";
+  * needs the package RAPL sensor (Energy Meter); no admin rights required.
+  The original power plan values are restored afterwards.
+* **Windows, manual mode** (`--sweep-mode manual` or step 4 of the menu) —
+  before each step the app asks you to set the limit in ThrottleStop or
+  Intel XTU and press Enter. Use it for single-thread and below the floor.
+* **AMD** — not supported yet (limits are set via `ryzenadj`).
+* If the average package power of a step exceeds the limit by more than 10 %,
+  the row is marked `!`: the limit was not actually enforced (BIOS lock, EC,
+  thermald, TLP, …). If another program changed the limit during a step, it
+  is listed under warnings.
+* After every limit change there is a `--settle` pause (10 s). In the
+  interactive menu this is step 3, which also shows the total run time.
+* A `.csv` with the step table is saved next to the `.txt` — handy for a
+  PPW-vs-power chart.
 
 ## Sample output
 
@@ -267,7 +313,8 @@ ppw-bench/
 ├── ppwbench/
 │   ├── cli.py              # command line, menu
 │   ├── core.py             # bench build, phases, PPW
-│   ├── report.py           # report
+│   ├── report.py           # report (+ power sweep CSV)
+│   ├── powerlimit.py       # power limits for --sweep
 │   └── platforms/
 │       ├── windows.py      # PDH, registry, powercfg
 │       └── linux.py        # powercap, /proc, /sys
