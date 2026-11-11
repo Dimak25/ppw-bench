@@ -32,37 +32,90 @@ def print_sensors(reader) -> None:
         print(f"   ! {hint}")
 
 
-def interactive_menu(reader, hybrid: bool) -> tuple[float, str | None] | None:
-    """Спрашивает режим теста.
+SUITES = {
+    # ключ: (подпись, MT-фаза, ST-фазы)
+    "cpu": ("Весь процессор", True, True),
+    "mt": ("Только многопоток", True, False),
+    "st": ("Только однопоток", False, True),
+}
+MENU_DURATIONS = (20.0, 60.0, 120.0)
 
-    Возвращает (длительность фазы, режим --pin или None) либо None (выход).
-    На гибридных CPU есть пункт «ST на каждом типе ядер»."""
-    durations = {"2": 20.0, "3": 60.0, "4": 120.0}
-    choices = {"0", "1", "2", "3", "4"} | ({"5"} if hybrid else set())
+
+def suite_phase_count(suite: str, tiers: dict[str, list[int]] | None) -> int:
+    """Сколько фаз будет в наборе: MT + по одной ST на каждый тип ядер."""
+    _label, mt, st = SUITES[suite]
+    st_count = sum(1 for t in TIER_ORDER if tiers.get(t)) if tiers else 1
+    return int(mt) + (st_count if st else 0)
+
+
+def estimate_seconds(phases: int, duration: float, cooldown: float) -> float:
+    """Примерное время прогона: фазы + ~3 с на запуск каждой + паузы между ними."""
+    return (duration + 3) * phases + cooldown * max(phases - 1, 0)
+
+
+def _fmt_total(seconds: float) -> str:
+    minutes = seconds / 60
+    return f"~{seconds:.0f} с" if minutes < 1.5 else f"~{minutes:.0f} мин"
+
+
+def _st_desc(tiers: dict[str, list[int]] | None) -> str:
+    if not tiers:
+        return "однопоток"
+    names = " / ".join(TIER_NAMES[t] for t in TIER_ORDER if tiers.get(t))
+    return f"однопоток на {names}-ядрах"
+
+
+def interactive_menu(reader, tiers: dict[str, list[int]] | None,
+                     cooldown: float = DEFAULT_COOLDOWN) -> dict | None:
+    """Интерактивное меню в два шага: какой набор тестов и сколько секунд на фазу.
+
+    Возвращает {"suite", "duration", "pin", "no_st", "only_st"} либо None (выход).
+    На гибридных CPU однопоточная фаза идёт отдельно на каждом типе ядер."""
+    st_desc = _st_desc(tiers)
+    descs = {
+        "cpu": f"многопоток + {st_desc}",
+        "mt": "все потоки",
+        "st": st_desc,
+    }
+    suite_keys = {"1": "cpu", "2": "mt", "3": "st"}
     print(f"PPW Bench {__version__} — интерактивный режим")
     print()
     while True:
-        print("Что запустить?")
-        print("  1. Показать датчики мощности")
-        print("  2. Быстрый тест      — 20 с на фазу")
-        print("  3. Обычный тест      — 60 с на фазу")
-        print("  4. Длительный тест   — 120 с на фазу")
-        if hybrid:
-            print("  5. Один поток на каждом типе ядер (P / E / LP-E) — по 30 с")
+        print("Шаг 1. Какой тест запустить?")
+        for num, key in suite_keys.items():
+            print(f"  {num}. {SUITES[key][0]:<18} — {descs[key]}")
+        print("  4. Показать датчики мощности")
         print("  0. Выход")
-        choice = util.ask_choice("Выбор [3]: ", choices, "3")
+        choice = util.ask_choice("Выбор [1]: ", {"0", "1", "2", "3", "4"}, "1")
         print()
         if choice == "0":
             return None
-        if choice == "1":
+        if choice == "4":
             print_sensors(reader)
             print()
             util.pause("Нажмите Enter, чтобы вернуться в меню...")
             print()
             continue
-        if choice == "5":
-            return 30.0, "all"
-        return durations[choice], None
+        suite = suite_keys[choice]
+        phases = suite_phase_count(suite, tiers)
+
+        print("Шаг 2. Сколько секунд на каждую фазу?")
+        for i, d in enumerate(MENU_DURATIONS, 1):
+            total = _fmt_total(estimate_seconds(phases, d, cooldown))
+            print(f"  {i}. {d:>3.0f} с   (фаз: {phases}, всего {total})")
+        print("  0. Назад")
+        dchoice = util.ask_choice("Выбор [2]: ", {"0", "1", "2", "3"}, "2")
+        print()
+        if dchoice == "0":
+            continue
+        _label, mt, st = SUITES[suite]
+        return {
+            "suite": suite,
+            "duration": MENU_DURATIONS[int(dchoice) - 1],
+            "pin": "all" if st and tiers else "auto",
+            "no_st": not st,
+            "only_st": not mt,
+        }
 
 
 PIN_MODES = ("auto", "p", "e", "lpe", "all", "none")
@@ -176,13 +229,13 @@ def main() -> int:
     reader.prime()
     pin_mode = args.pin
     if interactive:
-        chosen = interactive_menu(reader, hybrid=backend.core_types() is not None)
+        chosen = interactive_menu(reader, backend.core_types(), args.cooldown)
         if chosen is None:
             return 0
-        duration, menu_pin = chosen
-        if menu_pin:
-            pin_mode = menu_pin
-            args.only_st = True
+        duration = chosen["duration"]
+        pin_mode = chosen["pin"]
+        args.no_st = chosen["no_st"]
+        args.only_st = chosen["only_st"]
     else:
         if duration < 8:
             ap.error("--duration должен быть >= 8 секунд")
@@ -244,7 +297,7 @@ def main() -> int:
         "warnings": warnings,
     }
 
-    total_time = (duration + 3) * len(plan) + cooldown * (len(plan) - 1)
+    total_time = estimate_seconds(len(plan), duration, cooldown)
     print(f"CPU: {meta['cpu']}  ({meta['cores']} ядер / {meta['threads']} потоков)")
     print(f"Мощность: {source}")
     print(f"Питание: {power_note}; {meta['profile']}")
