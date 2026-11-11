@@ -68,6 +68,13 @@ def is_interactive() -> bool:
         return False
 
 
+def stdin_is_tty() -> bool:
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except Exception:
+        return False
+
+
 def ask_choice(prompt: str, choices: set[str], default: str) -> str:
     while True:
         try:

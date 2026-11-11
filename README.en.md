@@ -164,6 +164,8 @@ With no arguments a two-step interactive menu opens:
    be shown from here too.
 2. **Seconds per phase:** 20, 60 or 120 s — the same for every phase. The
    phase count and estimated total time are shown next to each option.
+3. **Power sweep:** no, the default 5–45 W steps, or your own (see
+   [below](#power-sweep)).
 
 After the test the app asks whether to save the `.txt` report and keeps the
 window open.
@@ -179,6 +181,8 @@ window open.
 | `--pin MODE` | cores for the single-thread phase: `auto` (default), `p`, `e`, `lpe`, `all` (a separate phase on each core type), `none` or a CPU list (`0,2,4-7`) |
 | `--repeat N` | run each phase N times; the report shows medians and the run-to-run spread |
 | `--watts N` | use a fixed CPU wattage (no sensors available) |
+| `--sweep W,W,...` | power sweep: run the phases at each power limit, e.g. `5,8,10,15,20,28,35,45` |
+| `--settle N` | pause after each limit change, s (default 10) |
 | `--out FILE` | report path (default `ppw-report-*.txt`) |
 | `--list` | list detected sensors and exit |
 | `--interactive` | open the interactive menu |
@@ -218,6 +222,32 @@ runs.
 ```bat
 ppw-bench.exe --quick --repeat 3
 ```
+
+### Power sweep
+
+PPW depends heavily on the power limit: at 10 W a CPU is usually far more
+efficient than at 45 W. `--sweep` runs the selected phases at each limit
+step (PL1 = PL2, no boost) and prints a "limit × phase" table.
+
+```bash
+sudo ./ppw-bench --sweep 5,8,10,15,20,28,35,45 --duration 30 --no-st
+```
+
+* **Linux (Intel)** — limits are set automatically through powercap
+  (`intel-rapl` and `intel-rapl-mmio` when both exist). Requires root. The
+  original limits are saved and restored afterwards — also on errors, Ctrl+C
+  and a closed terminal.
+* **Windows** — there is no public API for PL1: before each step the app asks
+  you to set the limit in ThrottleStop or Intel XTU and press Enter.
+* **AMD** — not supported yet (limits are set via `ryzenadj`).
+* If the average package power of a step exceeds the limit by more than 10 %,
+  the row is marked `!`: the limit was not actually enforced (BIOS lock, EC,
+  thermald, TLP, …). If another program changed the limit during a step, it
+  is listed under warnings.
+* After every limit change there is a `--settle` pause (10 s). In the
+  interactive menu this is step 3, which also shows the total run time.
+* A `.csv` with the step table is saved next to the `.txt` — handy for a
+  PPW-vs-power chart.
 
 ## Sample output
 
@@ -267,7 +297,8 @@ ppw-bench/
 ├── ppwbench/
 │   ├── cli.py              # command line, menu
 │   ├── core.py             # bench build, phases, PPW
-│   ├── report.py           # report
+│   ├── report.py           # report (+ power sweep CSV)
+│   ├── powerlimit.py       # power limits for --sweep
 │   └── platforms/
 │       ├── windows.py      # PDH, registry, powercfg
 │       └── linux.py        # powercap, /proc, /sys
