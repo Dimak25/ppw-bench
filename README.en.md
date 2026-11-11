@@ -157,9 +157,16 @@ py ppw_bench.py --list          :: list power sensors and exit
 
 Or double-click `run.bat` / `ppw-bench.exe`.
 
-With no arguments an interactive menu opens: show power sensors, quick test
-(20 s), normal (60 s) or long (120 s). After the test the app asks whether to
-save the `.txt` report and keeps the window open.
+With no arguments a two-step interactive menu opens:
+
+1. **Which test:** whole CPU (multi-thread + single-thread on each core type:
+   P / E / LP-E), multi-thread only or single-thread only. Power sensors can
+   be shown from here too.
+2. **Seconds per phase:** 20, 60 or 120 s — the same for every phase. The
+   phase count and estimated total time are shown next to each option.
+
+After the test the app asks whether to save the `.txt` report and keeps the
+window open.
 
 | Option | Description |
 |--------|-------------|
@@ -191,7 +198,7 @@ runs.
   cores exist on Core Ultra series 1, Meteor Lake); `--pin none` — the old behaviour.
 * `--pin all` — the single-thread phase runs on each core type in turn
   (P → E → LP-E); the summary shows `ST (P)`, `ST (E)`, `ST (LP-E)`. In the
-  interactive menu this is item 5 (shown on hybrid CPUs only).
+  interactive menu the "whole CPU" and "single-thread only" items work this way.
 
   ```bat
   ppw-bench.exe --only-st --pin all --duration 30 --repeat 3
