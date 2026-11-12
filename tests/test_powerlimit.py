@@ -236,7 +236,7 @@ def test_initial_cap_uses_history():
     assert 2200 < start < 2600
 
 
-POWERCFG_QH = """GUID схемы питания: a1841308-...  (Экономия энергии)
+POWERCFG_QH = """GUID схемы питания: {scheme}  (Экономия энергии)
   Псевдоним GUID: SCHEME_MAX
     GUID параметра питания: 75b0ae3f-bce0-45a7-8c89-c9611c25e100  (Максимальная частота процессора)
       Псевдоним GUID: PROCFREQMAX
@@ -247,20 +247,38 @@ POWERCFG_QH = """GUID схемы питания: a1841308-...  (Экономия
     Текущий индекс параметра питания от батареи: 0x{dc:08x}
 """
 
+SAVER = "a1841308-3541-4fab-bc81-f71556f20b4a"
+BALANCED = "381b4222-f694-41f0-9685-ff5bb260df2e"
+
 
 class FakePowercfg:
+    """powercfg с несколькими схемами: значения хранятся по GUID схемы."""
+
     def __init__(self, ac=0, dc=3700):
-        self.vals = {name: [ac, dc] for name in powerlimit.FREQ_SETTINGS}
-        self.activations = 0
+        self.active = SAVER
+        self.schemes = {g: {n: [ac, dc] for n in powerlimit.FREQ_SETTINGS}
+                        for g in (SAVER, BALANCED)}
+        self.activations: list[str] = []
+
+    @property
+    def vals(self):
+        return self.schemes[SAVER]
+
+    def _scheme(self, name):
+        return self.active if name == "SCHEME_CURRENT" else name
 
     def __call__(self, *args):
+        if args[0] == "/getactivescheme":
+            return f"GUID схемы питания: {self.active}  (Экономия энергии)"
         if args[0] == "/qh":
-            ac, dc = self.vals[args[3]]
-            return POWERCFG_QH.format(ac=ac, dc=dc)
+            ac, dc = self.schemes[self._scheme(args[1])][args[3]]
+            return POWERCFG_QH.format(scheme=self._scheme(args[1]), ac=ac, dc=dc)
         if args[0] in ("/setacvalueindex", "/setdcvalueindex"):
-            self.vals[args[3]][0 if args[0] == "/setacvalueindex" else 1] = int(args[4])
+            idx = 0 if args[0] == "/setacvalueindex" else 1
+            self.schemes[self._scheme(args[1])][args[3]][idx] = int(args[4])
         elif args[0] == "/setactive":
-            self.activations += 1
+            self.active = self._scheme(args[1])
+            self.activations.append(self.active)
         return ""
 
 
@@ -269,18 +287,79 @@ def test_read_freq_caps_parses_last_two_values():
     assert caps == {"PROCFREQMAX": (0, 3700), "PROCFREQMAX1": (0, 3700)}
 
 
-def test_freqcap_limiter_save_set_verify_restore():
+def test_freqcap_limiter_save_set_verify_restore(tmp_path):
     pc = FakePowercfg(ac=0, dc=3700)
-    lim = powerlimit.FreqCapLimiter(run=pc)
+    journal = tmp_path / "j.json"
+    lim = powerlimit.FreqCapLimiter(run=pc, journal=journal)
     assert lim.problem() is None and lim.mt_only
     lim.save()
+    assert journal.exists()  # журнал пишется до первой записи
     lim._set(1650)
-    assert pc.vals["PROCFREQMAX"] == [1650, 1650] and pc.activations == 1
+    assert pc.vals["PROCFREQMAX"] == [1650, 1650] and pc.activations == [SAVER]
+    assert '"applied": 1650' in journal.read_text(encoding="utf-8")
     assert lim.verify() == []
     pc.vals["PROCFREQMAX1"][0] = 2000  # кто-то поменял план
     assert lim.verify() == ["PROCFREQMAX1: 1650 → 2000 МГц"]
     assert lim.restore() == []
     assert pc.vals == {"PROCFREQMAX": [0, 3700], "PROCFREQMAX1": [0, 3700]}
+    assert not journal.exists()
+    assert lim.restore() == []  # повторный вызов (обработчик консоли + finally) — no-op
+
+
+def test_freqcap_restore_goes_to_original_scheme(tmp_path):
+    """Схему сменили посреди замера: возвращаем значения в исходную схему и
+    не переключаем пользователю план обратно."""
+    pc = FakePowercfg(ac=0, dc=3700)
+    lim = powerlimit.FreqCapLimiter(run=pc, journal=tmp_path / "j.json")
+    lim.save()
+    lim._set(1200)
+    pc.active = BALANCED  # пользователь подключил зарядку / сменил схему
+    assert "сменилась" in lim.verify()[0]
+    assert lim.restore() == []
+    assert pc.schemes[SAVER]["PROCFREQMAX"] == [0, 3700]
+    assert pc.schemes[BALANCED]["PROCFREQMAX"] == [0, 3700]  # не тронута
+    assert pc.active == BALANCED
+
+
+def test_recover_pending_restores_after_crash(tmp_path):
+    pc = FakePowercfg(ac=0, dc=3700)
+    journal = tmp_path / "j.json"
+    lim = powerlimit.FreqCapLimiter(run=pc, journal=journal)
+    lim.save()
+    lim._set(800)  # процесс «убили» здесь: restore() не вызывался
+    msgs = powerlimit.recover_pending(run=pc, journal=journal)
+    assert "возвращены" in msgs[0]
+    assert pc.vals == {"PROCFREQMAX": [0, 3700], "PROCFREQMAX1": [0, 3700]}
+    assert not journal.exists()
+    assert powerlimit.recover_pending(run=pc, journal=journal) == []
+
+
+def test_recover_pending_keeps_user_changes(tmp_path):
+    pc = FakePowercfg(ac=0, dc=3700)
+    journal = tmp_path / "j.json"
+    lim = powerlimit.FreqCapLimiter(run=pc, journal=journal)
+    lim.save()
+    lim._set(800)
+    pc.vals["PROCFREQMAX"] = [2500, 2500]  # пользователь уже поправил сам
+    msgs = powerlimit.recover_pending(run=pc, journal=journal)
+    assert "оставляю как есть" in msgs[0]
+    assert pc.vals["PROCFREQMAX"] == [2500, 2500] and not journal.exists()
+
+
+def test_recover_pending_broken_journal(tmp_path):
+    journal = tmp_path / "j.json"
+    journal.write_text("{not json", encoding="utf-8")
+    assert "повреждённый" in powerlimit.recover_pending(run=FakePowercfg(), journal=journal)[0]
+    assert not journal.exists()
+
+
+def test_console_guard_restores_on_close_only():
+    calls = []
+    guard = powerlimit._ConsoleGuard(lambda: calls.append(1))
+    assert guard.handle(0) is False and calls == []  # Ctrl+C -> KeyboardInterrupt и finally
+    assert guard.handle(2) is False and calls == [1]  # закрытие окна
+    guard.handle(1)  # Ctrl+Break
+    assert calls == [1, 1]
 
 
 def test_freqcap_limiter_reports_broken_powercfg():
@@ -355,3 +434,23 @@ def test_calibrate_does_not_trust_low_max_power():
     cpu = FakeCPU()
     cap, power, status = powerlimit.calibrate(25, cpu.set_cap, cpu.measure, 2000, max_power=24.0)
     assert status == "ok" and cap > 0 and abs(power / 25 - 1) <= 0.05
+
+
+def test_best_ppw_skips_steps_where_limit_was_not_held():
+    def ph(ppw, held):
+        return dict(_phase(8, ppw * 10, 10), ppw=ppw, limit_held=held)
+
+    meta = {"date": "d", "cpu": "c", "cores": 4, "threads": 8, "os": "o", "power": "p",
+            "duration": 20, "warmup": 8, "warnings": []}
+    steps = [{"target": 10, "applied": 10, "phases": [ph(1e8, True)]},
+             {"target": 15, "applied": 15, "phases": [ph(2e8, False)]}]
+    assert "при лимите 10 Вт\n" in report.build_sweep_report(meta, steps, "src") + "\n"
+    steps[0]["phases"][0]["limit_held"] = False
+    assert "при лимите 15 Вт (лимит нигде не соблюдался)" in report.build_sweep_report(meta, steps, "src")
+
+
+def test_sweep_and_interactive_conflict(monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["ppw-bench", "--interactive", "--sweep", "10"])
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert "нельзя сочетать" in capsys.readouterr().err

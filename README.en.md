@@ -84,7 +84,7 @@ Ready-made builds from [Releases](https://github.com/Dimak25/ppw-bench/releases/
 * `ppw-bench-vX.Y.Z-linux-x86_64.tar.gz` — the script plus a static `bench`
   (~400 KB). Needs only `python3` >= 3.9, which ships with almost every distro.
 * `ppw-bench-vX.Y.Z-linux-x86_64` — a standalone binary built with Nuitka, no
-  Python needed (~4 MB, glibc >= 2.35: Ubuntu 22.04+, Debian 12+, Fedora 36+).
+  Python needed (~6 MB, glibc >= 2.35: Ubuntu 22.04+, Debian 12+, Fedora 36+).
 
 ```bash
 tar xzf ppw-bench-v*-linux-x86_64.tar.gz
@@ -251,7 +251,10 @@ sudo ./ppw-bench --sweep 5,8,10,15,20,28,35,45 --duration 30 --no-st
   * power has a floor (~14 W on a Core Ultra 9 185H): lower steps are marked
     "skipped";
   * needs the package RAPL sensor (Energy Meter); no admin rights required.
-  The original power plan values are restored afterwards.
+  The original power plan values are restored afterwards — also when the
+  console window is closed. If the process dies outright (power loss), the
+  next run restores them: the originals are kept in
+  `%LOCALAPPDATA%\ppw-bench\freqcap-restore.json`.
 * **Windows, manual mode** (`--sweep-mode manual` or step 4 of the menu) —
   before each step the app asks you to set the limit in ThrottleStop or
   Intel XTU and press Enter. Use it for single-thread and below the floor.

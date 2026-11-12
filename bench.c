@@ -11,7 +11,7 @@
  *   BUILD <compiler version>
  *   THREADS <n>
  *   START
- *   TICK <elapsed_ms> <total_work_units>      (once per second)
+ *   TICK <elapsed_ms> <total_work_units>      (about once per second, actual time)
  *   ...
  *   STOP <elapsed_ms> <total_work_units>      (workload ends)
  *   FREQ <thread> <cpu> <mhz>                 (one per thread, see probe)
@@ -205,10 +205,15 @@ static void monitor_loop(void)
     double next = 1000.0;
     for (;;) {
         double e = elapsed_ms();
-        while (e >= next) {
-            printf("TICK %.0f %llu\n", next, total_work());
+        if (e >= next) {
+            /* Actual time of the read, not the scheduled `next`: the monitor
+             * wakes up to ~30 ms late, and pairing the planned time with a
+             * later work count skews the per-second rates by up to ~3 %. */
+            unsigned long long w = total_work();
+            printf("TICK %.1f %llu\n", elapsed_ms(), w);
             fflush(stdout);
-            next += 1000.0;
+            while (next <= e)
+                next += 1000.0;
         }
         if (e >= g_seconds * 1000.0) {
             atomic_store(&g_stop, 1);

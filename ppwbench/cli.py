@@ -420,6 +420,13 @@ def main() -> int:
         ap.error("--repeat должен быть от 1 до 20")
     if args.settle < 0:
         ap.error("--settle не может быть отрицательным")
+    if args.interactive and args.sweep:
+        ap.error("--sweep нельзя сочетать с --interactive: ступени выбираются в меню (шаг 3)")
+
+    if backend.NAME == "Windows":
+        # прошлый ступенчатый замер мог оборваться с выставленным потолком частоты
+        for msg in powerlimit.recover_pending():
+            print(f"  ! {msg}")
 
     reader = backend.PowerReader()
     reader.prime()

@@ -23,9 +23,11 @@ Windows: штатного API для PL1 нет. Два варианта:
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -331,18 +333,118 @@ def _powercfg(*args: str) -> str:
     return out
 
 
-def read_freq_caps(run=_powercfg) -> dict[str, tuple[int, int]]:
-    """{"PROCFREQMAX": (AC, DC), ...} активной схемы, МГц (0 — без ограничения).
+def _active_scheme(run=_powercfg) -> str:
+    """GUID активной схемы электропитания."""
+    m = re.search(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", run("/getactivescheme"))
+    if not m:
+        raise LimitError("powercfg не вернул GUID активной схемы")
+    return m.group(0).lower()
+
+
+def read_freq_caps(run=_powercfg, scheme: str = "SCHEME_CURRENT") -> dict[str, tuple[int, int]]:
+    """{"PROCFREQMAX": (AC, DC), ...} схемы scheme, МГц (0 — без ограничения).
 
     Параметры скрытые, поэтому /qh. Текст ответа зависит от языка Windows,
     но значения AC и DC — всегда два последних числа 0x........ в нём."""
     caps = {}
     for name in FREQ_SETTINGS:
-        vals = re.findall(r"0x[0-9a-fA-F]{8}", run("/qh", "SCHEME_CURRENT", "SUB_PROCESSOR", name))
+        vals = re.findall(r"0x[0-9a-fA-F]{8}", run("/qh", scheme, "SUB_PROCESSOR", name))
         if len(vals) < 2:
             raise LimitError(f"powercfg не вернул значения {name}")
         caps[name] = (int(vals[-2], 16), int(vals[-1], 16))
     return caps
+
+
+def _default_journal() -> Path:
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    return Path(base) / "ppw-bench" / "freqcap-restore.json"
+
+
+def _write_caps(run, scheme: str, values: dict[str, tuple[int, int]]) -> None:
+    for name, (ac, dc) in values.items():
+        run("/setacvalueindex", scheme, "SUB_PROCESSOR", name, str(ac))
+        run("/setdcvalueindex", scheme, "SUB_PROCESSOR", name, str(dc))
+    # применяем, только если схема по-прежнему активна: /setactive на другую
+    # схему переключил бы пользователю план электропитания
+    if _active_scheme(run) == scheme:
+        run("/setactive", scheme)
+
+
+def recover_pending(run=_powercfg, journal: Path | None = None) -> list[str]:
+    """Если прошлый замер прервался (закрыли окно, пропало питание), возвращает
+    исходные потолки частоты из журнала. Возвращает сообщения для пользователя.
+
+    Возвращаем, только если в схеме всё ещё стоит потолок, выставленный нами:
+    если пользователь уже поменял настройки сам, их не трогаем."""
+    journal = journal or _default_journal()
+    if not journal.exists():
+        return []
+    try:
+        data = json.loads(journal.read_text(encoding="utf-8"))
+        scheme = data["scheme"]
+        original = {k: (int(v[0]), int(v[1])) for k, v in data["values"].items()}
+        applied = data.get("applied")
+    except (OSError, ValueError, KeyError, TypeError, IndexError):
+        journal.unlink(missing_ok=True)
+        return ["Найден повреждённый журнал прерванного замера — удалён."]
+
+    def fmt(vals: dict[str, tuple[int, int]]) -> str:
+        return ", ".join(f"{k} сеть {ac or 'без огр.'} / батарея {dc or 'без огр.'}"
+                         for k, (ac, dc) in vals.items())
+
+    try:
+        current = read_freq_caps(run, scheme)
+        ours = applied is None or all(ac == applied and dc == applied
+                                      for ac, dc in current.values())
+        if ours:
+            _write_caps(run, scheme, original)
+            msg = ("Прошлый ступенчатый замер прервался — исходные потолки частоты "
+                   f"возвращены ({fmt(original)}).")
+        else:
+            msg = ("Прошлый ступенчатый замер прервался, но потолки частоты с тех пор "
+                   f"изменены — оставляю как есть. Исходные были: {fmt(original)}.")
+    except (LimitError, OSError, subprocess.SubprocessError) as exc:
+        return [f"Прошлый замер прервался, а вернуть потолки частоты не удалось ({exc}). "
+                f"Исходные: {fmt(original)} — верните их вручную (powercfg) или "
+                "запустите ppw-bench ещё раз."]
+    journal.unlink(missing_ok=True)
+    return [msg]
+
+
+class _ConsoleGuard:
+    """Windows: при закрытии окна консоли, Ctrl+Break, выходе из системы
+    процесс завершается без finally-блоков. Обработчик консоли успевает
+    (у него ~5 с) вернуть настройки прямо в своём потоке."""
+
+    EVENTS = {1, 2, 5, 6}  # CTRL_BREAK, CTRL_CLOSE, CTRL_LOGOFF, CTRL_SHUTDOWN
+
+    def __init__(self, restore) -> None:
+        self._restore = restore
+        self._cb = None
+
+    def handle(self, ctrl_type: int) -> bool:
+        if ctrl_type in self.EVENTS:
+            try:
+                self._restore()
+            except Exception:
+                pass
+        return False  # дальше — обработчик по умолчанию (завершение процесса)
+
+    def install(self) -> None:
+        if os.name != "nt" or self._cb is not None:
+            return
+        import ctypes
+        from ctypes import wintypes
+        proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+        self._cb = proto(lambda t: bool(self.handle(int(t))))
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(self._cb, True)
+
+    def remove(self) -> None:
+        if self._cb is None:
+            return
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(self._cb, False)
+        self._cb = None
 
 
 class FreqCapLimiter:
@@ -355,11 +457,15 @@ class FreqCapLimiter:
     MEASURE_S = 1.5   # окно усреднения мощности
     WARMUP_S = 2.0    # прогрев нагрузки перед первым замером максимума
 
-    def __init__(self, reader=None, run=_powercfg) -> None:
+    def __init__(self, reader=None, run=_powercfg, journal: Path | None = None) -> None:
         self.reader = reader
         self._run = run
+        self.journal = journal or _default_journal()
+        self._scheme: str | None = None
         self._saved: dict[str, tuple[int, int]] = {}
         self._applied: int | None = None
+        self._lock = threading.Lock()
+        self._guard = _ConsoleGuard(self.restore)
         self.history: list[tuple[int, float]] = []
         self.max_power: float | None = None
         self.last_note: str | None = None
@@ -369,6 +475,7 @@ class FreqCapLimiter:
         self._problem: str | None = None
         try:
             read_freq_caps(run)
+            _active_scheme(run)
         except (LimitError, OSError, subprocess.SubprocessError) as exc:
             self._problem = f"не удалось прочитать настройки плана электропитания ({exc})"
 
@@ -387,8 +494,23 @@ class FreqCapLimiter:
         """Нагрузка и датчики для подбора потолка (известны только после сборки bench)."""
         self._exe, self._sampler, self._threads = exe, sampler, threads
 
+    def _write_journal(self) -> None:
+        """Журнал на диске: при обрыве процесса его подхватит recover_pending()."""
+        try:
+            self.journal.parent.mkdir(parents=True, exist_ok=True)
+            self.journal.write_text(json.dumps({
+                "scheme": self._scheme,
+                "values": {k: list(v) for k, v in self._saved.items()},
+                "applied": self._applied,
+            }), encoding="utf-8")
+        except OSError:
+            pass  # без журнала остаётся finally и обработчик консоли
+
     def save(self) -> None:
-        self._saved = read_freq_caps(self._run)
+        self._scheme = _active_scheme(self._run)
+        self._saved = read_freq_caps(self._run, self._scheme)
+        self._write_journal()
+        self._guard.install()
 
     def saved_lines(self) -> list[str]:
         def fmt(v: int) -> str:
@@ -397,11 +519,16 @@ class FreqCapLimiter:
                 for name, (ac, dc) in self._saved.items()]
 
     def _set(self, mhz: int) -> None:
-        for name in FREQ_SETTINGS:
-            for idx in ("/setacvalueindex", "/setdcvalueindex"):
-                self._run(idx, "SCHEME_CURRENT", "SUB_PROCESSOR", name, str(mhz))
-        self._run("/setactive", "SCHEME_CURRENT")
-        self._applied = mhz
+        scheme = self._scheme or "SCHEME_CURRENT"
+        with self._lock:
+            if self._saved:
+                self._applied = mhz
+                self._write_journal()  # до записи: обрыв посередине тоже подхватится
+            for name in FREQ_SETTINGS:
+                for idx in ("/setacvalueindex", "/setdcvalueindex"):
+                    self._run(idx, scheme, "SUB_PROCESSOR", name, str(mhz))
+            self._run("/setactive", scheme)
+            self._applied = mhz
 
     def _measure(self) -> float | None:
         from ppwbench import core  # здесь, чтобы powerlimit не тянул core при импорте
@@ -445,24 +572,30 @@ class FreqCapLimiter:
         if self._applied is None:
             return []
         try:
-            caps = read_freq_caps(self._run)
+            if self._scheme and _active_scheme(self._run) != self._scheme:
+                return ["схема электропитания сменилась во время ступени — "
+                        "потолок частоты к ней не применялся"]
+            caps = read_freq_caps(self._run, self._scheme or "SCHEME_CURRENT")
         except LimitError as exc:
             return [str(exc)]
         return [f"{name}: {self._applied} → {ac} МГц"
                 for name, (ac, _dc) in caps.items() if ac != self._applied]
 
     def restore(self) -> list[str]:
-        if not self._saved:
-            return []
-        errors = []
-        try:
-            for name, (ac, dc) in self._saved.items():
-                self._run("/setacvalueindex", "SCHEME_CURRENT", "SUB_PROCESSOR", name, str(ac))
-                self._run("/setdcvalueindex", "SCHEME_CURRENT", "SUB_PROCESSOR", name, str(dc))
-            self._run("/setactive", "SCHEME_CURRENT")
-        except (LimitError, OSError, subprocess.SubprocessError) as exc:
-            errors.append(str(exc))
-        return errors
+        """Возвращает исходные значения в ту же схему. Повторный вызов — no-op
+        (его может сделать и обработчик консоли, и finally)."""
+        with self._lock:
+            if not self._saved:
+                return []
+            try:
+                _write_caps(self._run, self._scheme or "SCHEME_CURRENT", self._saved)
+            except (LimitError, OSError, subprocess.SubprocessError) as exc:
+                return [str(exc)]  # журнал остаётся: вернём при следующем запуске
+            self._saved = {}
+            self._applied = None
+            self.journal.unlink(missing_ok=True)
+        self._guard.remove()
+        return []
 
 
 def limit_held(target_w: float, power_w: float | None) -> bool | None:
