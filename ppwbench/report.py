@@ -106,14 +106,16 @@ def build_sweep_report(meta: dict, steps: list[dict], source: str) -> str:
         if phase_name(ph) not in names:
             names.append(phase_name(ph))
     for name in names:
-        best = None
-        for st in steps:
-            for ph in st["phases"]:
-                if phase_name(ph) == name and ph.get("ppw") and (
-                        best is None or ph["ppw"] > best[1]["ppw"]):
-                    best = (st["target"], ph)
+        cands = [(st["target"], ph) for st in steps for ph in st["phases"]
+                 if phase_name(ph) == name and ph.get("ppw")]
+        # ступени, где лимит не соблюдался («!»), в «лучший» не берём:
+        # там PPW снят не на заявленной мощности
+        held = [c for c in cands if c[1].get("limit_held") is not False]
+        best = max(held or cands, key=lambda c: c[1]["ppw"], default=None)
         if best:
-            L.append(f"  {name}: {fmt_si(best[1]['ppw'], 'ед/с на Вт')} при лимите {best[0]:g} Вт")
+            note = "" if held else " (лимит нигде не соблюдался)"
+            L.append(f"  {name}: {fmt_si(best[1]['ppw'], 'ед/с на Вт')} "
+                     f"при лимите {best[0]:g} Вт{note}")
         else:
             L.append(f"  {name}: PPW не измерен (нет датчика мощности)")
     L.append(BAR)
