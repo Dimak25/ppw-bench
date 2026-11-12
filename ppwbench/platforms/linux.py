@@ -20,7 +20,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from ppwbench.cpusets import classify_tiers, parse_cpulist
+from ppwbench.cpusets import classify_tiers, format_cpulist, parse_cpulist
 
 NAME = "Linux"
 
@@ -292,6 +292,18 @@ def cpu_load_pct(sample: float = 1.0) -> float | None:
     return max(0.0, min(100.0, 100.0 * (1.0 - (b[0] - a[0]) / total)))
 
 
+def capped_cpus() -> list[int]:
+    """CPU, у которых верхняя граница частоты ниже аппаратного максимума
+    (cpupower, TLP, auto-cpufreq и т.п.). Допуск 2 % на округления драйвера."""
+    out = []
+    for d in (SYSFS / "devices/system/cpu").glob("cpu[0-9]*"):
+        hw = _read_int(d / "cpufreq/cpuinfo_max_freq")
+        cur = _read_int(d / "cpufreq/scaling_max_freq")
+        if hw and cur and cur < hw * 0.98:
+            out.append(int(d.name[3:]))
+    return sorted(out)
+
+
 def environment_warnings() -> list[str]:
     warns: list[str] = []
     if ac_line_status() == 0:
@@ -316,6 +328,13 @@ def environment_warnings() -> list[str]:
         warns.append(
             "Governor powersave с драйвером acpi-cpufreq держит минимальную частоту: "
             "переключите на schedutil или performance."
+        )
+    capped = capped_cpus()
+    if capped:
+        warns.append(
+            f"Максимальная частота урезана (scaling_max_freq < cpuinfo_max_freq) на CPU "
+            f"{format_cpulist(capped)} — их результаты будут занижены. Вернуть: "
+            "sudo cpupower frequency-set -u <макс. частота> или настройки TLP / auto-cpufreq."
         )
     load = cpu_load_pct(1.0)
     if load is not None and load > 12.0:

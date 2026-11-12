@@ -8,7 +8,8 @@
     ppw-bench --watts 45            # если датчиков нет: задать мощность вручную
     ppw-bench --list                # показать найденные датчики и выйти
     sudo ppw-bench --sweep 5,10,15,25 --duration 30   # PPW на разных лимитах (Linux)
-    ppw-bench --isa all --no-st     # MT на каждом наборе инструкций: обычный, AVX2, AES
+    ppw-bench --isa all             # каждая фаза на каждом наборе: обычный, AVX2, AES
+    ppw-bench --mt-pin all --no-st  # многопоток отдельно на P-, E- и LP-E-ядрах
 """
 
 from __future__ import annotations
@@ -38,24 +39,30 @@ def print_sensors(reader) -> None:
 
 
 SUITES = {
-    # ключ: (подпись, MT-фаза, ST-фазы)
+    # ключ: (подпись, MT-фазы, ST-фазы)
     "cpu": ("Весь процессор", True, True),
     "mt": ("Только многопоток", True, False),
+    "mttiers": ("Многопоток по ядрам", True, False),
     "st": ("Только однопоток", False, True),
-    "isa": ("Наборы инструкций", True, False),
+}
+# готовые варианты шага «наборы инструкций»: номер -> (подпись, профили)
+ISA_PRESETS = {
+    "1": ("Только обычный", ["scalar"]),
+    "2": ("Все наборы", ["scalar", "avx2", "aes"]),
+    "3": ("Только AVX2+FMA", ["avx2"]),
+    "4": ("Только AES-NI", ["aes"]),
 }
 MENU_DURATIONS = (20.0, 60.0, 120.0)
 
 
 def suite_phase_count(suite: str, tiers: dict[str, list[int]] | None,
                       profiles: int = 1) -> int:
-    """Сколько фаз будет в наборе: MT + по одной ST на каждый тип ядер;
-    для наборов инструкций — по одной MT-фазе на профиль."""
-    if suite == "isa":
-        return profiles
+    """Сколько фаз будет в наборе: MT (на всех ядрах или по одной на тип ядер)
+    + по одной ST на каждый тип ядер — и всё это на каждый набор инструкций."""
     _label, mt, st = SUITES[suite]
-    st_count = sum(1 for t in TIER_ORDER if tiers.get(t)) if tiers else 1
-    return int(mt) + (st_count if st else 0)
+    tier_count = sum(1 for t in TIER_ORDER if tiers.get(t)) if tiers else 1
+    mt_count = (tier_count if suite == "mttiers" else 1) if mt else 0
+    return (mt_count + (tier_count if st else 0)) * profiles
 
 
 def estimate_seconds(phases: int, duration: float, cooldown: float) -> float:
@@ -74,11 +81,40 @@ def _fmt_total(seconds: float) -> str:
     return f"~{seconds:.0f} с" if minutes < 1.5 else f"~{minutes:.0f} мин"
 
 
+def _tier_names(tiers: dict[str, list[int]] | None) -> str:
+    return " / ".join(TIER_NAMES[t] for t in TIER_ORDER if tiers and tiers.get(t))
+
+
 def _st_desc(tiers: dict[str, list[int]] | None) -> str:
     if not tiers:
         return "однопоток"
-    names = " / ".join(TIER_NAMES[t] for t in TIER_ORDER if tiers.get(t))
-    return f"однопоток на {names}-ядрах"
+    return f"однопоток на {_tier_names(tiers)}-ядрах"
+
+
+def _ask_isa(profiles: list[str]):
+    """Шаг 2 меню: готовые варианты наборов инструкций.
+
+    Возвращает список профилей или "back". Если CPU умеет только обычный
+    профиль, шаг не показывается."""
+    if profiles == ["scalar"]:
+        return ["scalar"]
+    shown: dict[str, tuple[str, list[str]]] = {}
+    for key, (label, want) in ISA_PRESETS.items():
+        if key == "2":  # «все наборы» — все, что умеет этот CPU
+            if len(profiles) > 1:
+                shown[key] = (label, list(profiles))
+        elif all(w in profiles for w in want):
+            shown[key] = (label, want)
+    print("Шаг 2. Какие наборы инструкций?")
+    for key, (label, want) in shown.items():
+        what = ", ".join(core.PROFILE_LABELS[w] for w in want)
+        print(f"  {key}. {label:<16} — {what}")
+    print("  0. Назад")
+    choice = util.ask_choice("Выбор [1]: ", set(shown) | {"0"}, "1")
+    print()
+    if choice == "0":
+        return "back"
+    return [w for w in shown[choice][1] if w in profiles]
 
 
 def _sweep_cost(limiter, phases: int, has_st: bool) -> tuple[int, float]:
@@ -109,7 +145,7 @@ def _ask_sweep(limiter, phases: int, duration: float, cooldown: float,
     default = list(powerlimit.DEFAULT_STEPS)
     n_ph, extra = _sweep_cost(limiter, phases, has_st)
     total = _fmt_total(sweep_seconds(len(default), n_ph, duration, cooldown, settle + extra))
-    print("Шаг 3. Ступенчатый замер мощности (PPW на разных лимитах)?")
+    print("Шаг 4. Ступенчатый замер мощности (PPW на разных лимитах)?")
     if auto is not None and manual is not None:
         print(f"   Лимиты: {auto.describe()}; или вручную ({manual.TOOLS})")
     else:
@@ -143,7 +179,7 @@ def _ask_sweep(limiter, phases: int, duration: float, cooldown: float,
         print()
         break
     if auto is not None and manual is not None:
-        print("Шаг 4. Как выставлять лимит?")
+        print("Шаг 5. Как выставлять лимит?")
         print(f"  1. Автоматически — {auto.describe()}")
         print(f"  2. Вручную       — {manual.describe()}")
         if getattr(auto, "mt_only", False) and has_st:
@@ -161,27 +197,31 @@ def interactive_menu(reader, tiers: dict[str, list[int]] | None,
     """Интерактивное меню: какой набор тестов, сколько секунд на фазу и (если
     передан limiter) нужен ли ступенчатый замер мощности и как ставить лимит.
 
-    Возвращает {"suite", "duration", "pin", "no_st", "only_st", "sweep",
-    "limiter", "isa"} либо None (выход). На гибридных CPU однопоточная фаза
-    идёт на каждом типе ядер. profiles — профили нагрузки, которые умеет CPU."""
+    Возвращает {"suite", "duration", "pin", "mt_pin", "no_st", "only_st",
+    "sweep", "limiter", "isa"} либо None (выход). На гибридных CPU однопоточная
+    фаза идёт на каждом типе ядер, а «многопоток по ядрам» нагружает по очереди
+    все P-, все E- и все LP-E-ядра. profiles — профили, которые умеет CPU."""
     profiles = profiles or ["scalar"]
     st_desc = _st_desc(tiers)
     descs = {
         "cpu": f"многопоток + {st_desc}",
         "mt": "все потоки",
+        "mttiers": f"все {_tier_names(tiers)}-ядра по очереди",
         "st": st_desc,
-        "isa": "многопоток: " + ", ".join(core.PROFILE_LABELS[p] for p in profiles),
     }
-    suite_keys = {"1": "cpu", "2": "mt", "3": "st", "4": "isa"}
+    # нумерация постоянная; «по ядрам» есть только у гибридных CPU
+    suite_keys = {"1": "cpu", "2": "mt", "3": "mttiers", "4": "st"}
+    if not tiers:
+        del suite_keys["3"]
     print(f"PPW Bench {__version__} — интерактивный режим")
     print()
     while True:
         print("Шаг 1. Какой тест запустить?")
         for num, key in suite_keys.items():
-            print(f"  {num}. {SUITES[key][0]:<18} — {descs[key]}")
+            print(f"  {num}. {SUITES[key][0]:<19} — {descs[key]}")
         print("  5. Показать датчики мощности")
         print("  0. Выход")
-        choice = util.ask_choice("Выбор [1]: ", {"0", "1", "2", "3", "4", "5"}, "1")
+        choice = util.ask_choice("Выбор [1]: ", set(suite_keys) | {"0", "5"}, "1")
         print()
         if choice == "0":
             return None
@@ -192,9 +232,12 @@ def interactive_menu(reader, tiers: dict[str, list[int]] | None,
             print()
             continue
         suite = suite_keys[choice]
-        phases = suite_phase_count(suite, tiers, len(profiles))
+        isa = _ask_isa(profiles)
+        if isa == "back":
+            continue
+        phases = suite_phase_count(suite, tiers, len(isa))
 
-        print("Шаг 2. Сколько секунд на каждую фазу?")
+        print("Шаг 3. Сколько секунд на каждую фазу?")
         for i, d in enumerate(MENU_DURATIONS, 1):
             total = _fmt_total(estimate_seconds(phases, d, cooldown))
             print(f"  {i}. {d:>3.0f} с   (фаз: {phases}, всего {total})")
@@ -218,14 +261,22 @@ def interactive_menu(reader, tiers: dict[str, list[int]] | None,
             "duration": duration,
             "sweep": sweep,
             "limiter": chosen_limiter,
-            "isa": list(profiles) if suite == "isa" else ["scalar"],
+            "isa": isa,
             "pin": "all" if st and tiers else "auto",
+            "mt_pin": "all" if suite == "mttiers" else "none",
             "no_st": not st,
             "only_st": not mt,
         }
 
 
 PIN_MODES = ("auto", "p", "e", "lpe", "all", "none")
+
+
+def mt_pin_arg(value: str) -> str:
+    v = pin_arg(value)
+    if v == "auto":
+        raise argparse.ArgumentTypeError("для --mt-pin: none, all, p, e, lpe или список CPU")
+    return v
 
 
 def pin_arg(value: str) -> str:
@@ -249,14 +300,16 @@ def _tier_phase(tier: str, cpus: list[int], tag: str = "ST", auto: bool = False)
     return {"tag": tag, "cpus": cpus, "label": label, "core_kind": name}
 
 
-def resolve_st(mode: str, backend) -> tuple[list[dict], list[str]]:
-    """Режим --pin -> (однопоточные фазы, предупреждения).
+def resolve_st(mode: str, backend, tag: str = "ST",
+               flag: str = "--pin") -> tuple[list[dict], list[str]]:
+    """Режим --pin (или --mt-pin при tag="MT") -> (фазы, предупреждения).
 
     Фаза: {"tag", "cpus", "label", "core_kind"}. На гибридных CPU планировщик
     переносит однопоточную нагрузку между ядрами разных типов, и результат
     прыгает от прогона к прогону: auto закрепляет её на P-ядрах, p/e/lpe — на
     ядрах выбранного типа, all — запускает отдельную фазу на каждом типе."""
-    plain = {"tag": "ST", "cpus": None, "label": "без закрепления", "core_kind": None}
+    what = f"{tag}-фаза"
+    plain = {"tag": tag, "cpus": None, "label": "без закрепления", "core_kind": None}
     if mode == "none":
         return [plain], []
     if mode in ("auto", "p", "e", "lpe", "all"):
@@ -265,27 +318,34 @@ def resolve_st(mode: str, backend) -> tuple[list[dict], list[str]]:
             if mode == "auto":
                 return [dict(plain, label="без закрепления (CPU не гибридный)")], []
             return [plain], [
-                f"--pin {mode}: P/E-ядра не обнаружены (CPU не гибридный), "
-                "ST-фаза идёт без закрепления."
+                f"{flag} {mode}: P/E-ядра не обнаружены (CPU не гибридный), "
+                f"{what} идёт без закрепления."
             ]
         if mode == "auto":
-            return [_tier_phase("p", types["p"], auto=True)], []
+            return [_tier_phase("p", types["p"], tag=tag, auto=True)], []
         if mode == "all":
-            return [_tier_phase(t, types[t], tag=f"ST-{TIER_NAMES[t]}")
+            return [_tier_phase(t, types[t], tag=f"{tag}-{TIER_NAMES[t]}")
                     for t in TIER_ORDER if types.get(t)], []
         if not types.get(mode):
             found = ", ".join(TIER_NAMES[t] for t in TIER_ORDER if types.get(t))
             return [plain], [
-                f"--pin {mode}: {TIER_NAMES[mode]}-ядра не обнаружены "
-                f"(есть: {found}), ST-фаза идёт без закрепления."
+                f"{flag} {mode}: {TIER_NAMES[mode]}-ядра не обнаружены "
+                f"(есть: {found}), {what} идёт без закрепления."
             ]
-        return [_tier_phase(mode, types[mode])], []
+        return [_tier_phase(mode, types[mode], tag=tag)], []
     cpus = parse_cpulist(mode)
     return [dict(plain, cpus=cpus, label=f"CPU {format_cpulist(cpus)}")], []
 
 
+def resolve_mt(mode: str, backend) -> tuple[list[dict], list[str]]:
+    """Режим --mt-pin -> (многопоточные фазы, предупреждения). none — одна фаза
+    на всех ядрах; all — по фазе на каждый тип ядер (все P, все E, все LP-E)."""
+    phases, warns = resolve_st(mode, backend, tag="MT", flag="--mt-pin")
+    return [dict(ph, label=None) if ph["cpus"] is None else ph for ph in phases], warns
+
+
 def resolve_isa(requested: list[str], supported: list[str]) -> tuple[list[str], list[str]]:
-    """--isa -> (профили MT-фаз в порядке PROFILES, предупреждения о неподдерживаемых)."""
+    """--isa -> (профили фаз в порядке PROFILES, предупреждения о неподдерживаемых)."""
     if "all" in requested:
         return [p for p in core.PROFILES if p in supported], []
     out, warns = [], []
@@ -296,7 +356,7 @@ def resolve_isa(requested: list[str], supported: list[str]) -> tuple[list[str], 
             out.append(p)
         else:
             warns.append(f"--isa {p}: {core.PROFILE_LABELS[p]} не поддерживается этим CPU — "
-                         "фаза пропущена.")
+                         "фазы с ним пропущены.")
     return out, warns
 
 
@@ -304,6 +364,19 @@ def resolve_pin(mode: str, backend) -> tuple[list[int] | None, str, list[str]]:
     """Совместимость: одна ST-фаза -> (CPU, подпись, предупреждения)."""
     phases, warns = resolve_st(mode, backend)
     return phases[0]["cpus"], phases[0]["label"], warns
+
+
+def warmup_arg(value: str) -> float | None:
+    """--warmup auto | N (секунд)."""
+    if value.strip().lower() == "auto":
+        return None
+    try:
+        sec = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"ожидается auto или число секунд (получено {value!r})") from None
+    if sec < 0:
+        raise argparse.ArgumentTypeError("прогрев не может быть отрицательным")
+    return sec
 
 
 def isa_arg(value: str) -> list[str]:
@@ -359,6 +432,10 @@ def build_parser() -> argparse.ArgumentParser:
     phase_group = ap.add_mutually_exclusive_group()
     phase_group.add_argument("--no-st", action="store_true", help="не запускать single-thread фазу")
     phase_group.add_argument("--only-st", action="store_true", help="только single-thread фаза")
+    ap.add_argument("--warmup", type=warmup_arg, default=None, metavar="auto|N",
+                    help="прогрев в начале фазы, который не входит в замер: auto (по умолчанию) — "
+                         "не меньше 25 %% фазы (мин. 8 с), а если мощность ещё падала "
+                         "(конец буста PL2) — до момента, когда она установилась; N — ровно N с")
     ap.add_argument("--cooldown", type=float, default=DEFAULT_COOLDOWN,
                     help="пауза между фазами, с (0 = без паузы)")
     ap.add_argument("--pin", type=pin_arg, default="auto",
@@ -366,9 +443,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "p, e, lpe, all (отдельная фаза на каждом типе ядер), none "
                          "или список CPU, например 0,2,4-7")
     ap.add_argument("--isa", type=isa_arg, default=["scalar"], metavar="LIST",
-                    help="нагрузка многопоточной фазы: scalar (обычный код), avx2 (AVX2+FMA, "
-                         "GFLOPS), aes (AES-NI, GB/s) или all — по фазе на каждый "
-                         "поддерживаемый; однопоточные фазы всегда scalar")
+                    help="наборы инструкций: scalar (обычный код), avx2 (AVX2+FMA, "
+                         "GFLOPS), aes (AES-NI, GB/s) или all — каждая фаза (MT и ST) "
+                         "повторяется на каждом поддерживаемом наборе")
+    ap.add_argument("--mt-pin", type=mt_pin_arg, default="none",
+                    help="ядра для многопоточной фазы: none (все, по умолчанию), all "
+                         "(отдельная фаза на всех P-, всех E- и всех LP-E-ядрах), p, e, "
+                         "lpe или список CPU")
     ap.add_argument("--repeat", type=int, default=1,
                     help="повторить каждую фазу N раз; в отчёте медианы и разброс")
     ap.add_argument("--watts", type=float, default=None,
@@ -487,6 +568,7 @@ def main() -> int:
         pin_mode = chosen["pin"]
         args.no_st = chosen["no_st"]
         args.only_st = chosen["only_st"]
+        args.mt_pin = chosen["mt_pin"]
         sweep = chosen["sweep"]
         limiter = chosen["limiter"] or limiter
         isa = chosen["isa"]
@@ -535,16 +617,23 @@ def main() -> int:
     warnings += pin_warnings
     profiles, isa_warnings = resolve_isa(isa, supported)
     warnings += isa_warnings
-    if not profiles and args.only_st is False and args.no_st:
-        ap.error("--isa: ни один из выбранных профилей не поддерживается этим CPU")
-    phases_spec: list[dict] = []
+    if not profiles:
+        ap.error("--isa: ни один из выбранных наборов не поддерживается этим CPU")
+    mt_phases, mt_warnings = resolve_mt(args.mt_pin, backend)
+    warnings += mt_warnings
+    # базовые фазы (где и сколько потоков) x наборы инструкций, «по фазам»:
+    # MT обычный -> MT AVX2 -> ... -> ST-P обычный -> ST-P AVX2 -> ...
+    bases: list[dict] = []
     if not args.only_st:
-        for prof in profiles:
-            phases_spec.append({"tag": "MT" if prof == "scalar" else f"MT-{prof.upper()}",
-                                "threads": mt_threads, "cpus": None, "label": None,
-                                "core_kind": None, "profile": prof})
+        bases += [dict(ph, threads=len(ph["cpus"]) if ph["cpus"] else mt_threads)
+                  for ph in mt_phases]
     if not args.no_st:
-        phases_spec += [dict(ph, threads=1, profile="scalar") for ph in st_phases]
+        bases += [dict(ph, threads=1) for ph in st_phases]
+    phases_spec: list[dict] = []
+    for base in bases:
+        for prof in profiles:
+            tag = base["tag"] if prof == "scalar" else f"{base['tag']}-{prof.upper()}"
+            phases_spec.append(dict(base, tag=tag, profile=prof))
     if sweep and getattr(limiter, "mt_only", False):
         dropped = [ph for ph in phases_spec if ph["threads"] == 1]
         phases_spec = [ph for ph in phases_spec if ph["threads"] > 1]
@@ -566,7 +655,8 @@ def main() -> int:
         "power": power_note,
         "profile": backend.power_profile(),
         "duration": duration,
-        "warmup": core.warmup_seconds(duration),
+        "warmup": core.warmup_seconds(duration) if args.warmup is None else args.warmup,
+        "warmup_auto": args.warmup is None,
         "cooldown": cooldown,
         "repeat": repeat,
         "version": __version__,
@@ -586,13 +676,14 @@ def main() -> int:
     print(
         f"План: {len(phases_spec)} фаза(ы)"
         + (f" × {repeat} повтора(ов)" if repeat > 1 else "")
-        + f" по {duration:.0f} с (прогрев {meta['warmup']:.0f} с), ~{total_time:.0f} с всего"
+        + f" по {duration:.0f} с (прогрев {'от ' if meta['warmup_auto'] else ''}"
+          f"{meta['warmup']:.0f} с), ~{total_time:.0f} с всего"
         + (f" на ступень; ступени {powerlimit.fmt_steps(sweep)}, всего "
            f"{_fmt_total(sweep_seconds(len(sweep), len(plan), duration, cooldown, step_extra))}"
            if sweep else "")
     )
     for ph in phases_spec:
-        if ph["threads"] == 1:
+        if ph["label"] and ph["profile"] == profiles[0]:
             print(f"{ph['tag']}: {ph['label']}")
     if sweep:
         print(f"Лимиты: {limiter.describe()}")
@@ -614,17 +705,17 @@ def main() -> int:
             if ph["profile"] != "scalar":
                 label += f", {core.PROFILE_LABELS[ph['profile']]}"
             if ph["core_kind"]:
-                label += f", {ph['core_kind']}-ядро"
+                label += f", {ph['core_kind']}-ядр{'о' if threads == 1 else 'а'}"
             rep = f" #{r + 1}/{repeat}" if repeat > 1 else ""
             print(f"[{tag}{rep}] {label}, {threads} поток(ов), {duration:.0f} с ...", flush=True)
             res = core.apply_power_basis(
                 core.run_phase(exe, threads, duration, sampler, backend=backend, cpus=cpus,
-                               tiers=tiers, profile=ph["profile"]),
+                               tiers=tiers, profile=ph["profile"], warmup=args.warmup),
                 manual,
             )
             res["tag"] = tag
             res["core_kind"] = ph["core_kind"]
-            if threads == 1:
+            if cpus or threads == 1:
                 if cpus and not res["cpus"]:
                     res["pin_label"] = "без закрепления (не удалось задать аффинити)"
                     res["core_kind"] = None
@@ -641,6 +732,11 @@ def main() -> int:
                 + (f"   {freq['mhz'] / 1000:.2f} ГГц" if freq else ""),
                 flush=True,
             )
+            if res.get("settled") and res["warmup"] > meta["warmup"] + 0.5:
+                print(f"     прогрев {res['warmup']:.0f} с: мощность установилась не сразу", flush=True)
+            note = report.instability_note(res)
+            if note:
+                print(f"     ! {note}", flush=True)
         return [core.aggregate_runs(runs[ph["tag"]]) for ph in phases_spec]
 
     try:

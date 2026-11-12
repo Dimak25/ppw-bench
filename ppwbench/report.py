@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ppwbench import util
-from ppwbench.core import BASIS_LABELS, PROFILE_LABELS
+from ppwbench.core import BASIS_LABELS, PROFILE_LABELS, UNSTABLE_CV
 from ppwbench.cpusets import TIER_NAMES, TIER_ORDER
 from ppwbench.util import fmt_si
 
@@ -46,6 +46,18 @@ def fmt_total(ph: dict, work: float) -> str:
     return fmt_si(work * k, TOTAL_UNITS.get(name, "ед"))
 
 
+def instability_note(ph: dict) -> str | None:
+    """Предупреждение, если мощность в окне замера «гуляла»: внутри окна
+    закончился буст PL2 или сработал троттлинг — цифрам фазы верить нельзя,
+    а сравнение с соседними фазами зависит от их порядка."""
+    cv = ph.get("pkg_cv")
+    if ph.get("settled") is False or (cv is not None and cv > UNSTABLE_CV):
+        spread = f" (±{cv:.0f}%)" if cv is not None else ""
+        return (f"мощность нестабильна{spread}: вероятно, в окне закончился буст PL2 или "
+                "сработал троттлинг — повторите с 60–120 с на фазу")
+    return None
+
+
 def profile_label(ph: dict) -> str | None:
     """Подпись профиля нагрузки для фаз с особым набором инструкций."""
     prof = ph.get("profile")
@@ -61,7 +73,7 @@ def build_report(meta: dict, phases: list[dict], source: str) -> str:
         if profile_label(ph):
             kind += f", {profile_label(ph)}"
         if ph.get("core_kind"):
-            kind += f", {ph['core_kind']}-ядро"
+            kind += f", {ph['core_kind']}-ядр{'о' if ph['threads'] == 1 else 'а'}"
         basis = ph.get("basis")
         L.append(f"ФАЗА {i} — {kind} ({ph['threads']} поток(ов))")
         L.extend(_phase_lines(ph, basis))
@@ -71,9 +83,14 @@ def build_report(meta: dict, phases: list[dict], source: str) -> str:
     for ph in phases:
         kind = phase_name(ph)
         if ph.get("ppw"):
-            L.append(f"  {kind}: {fmt_ppw(ph, ph['ppw'])} ({BASIS_LABELS[ph['basis']]})")
+            cores = (f"; по ядрам {fmt_ppw(ph, ph['ppw_pp0'])}"
+                     if ph.get("ppw_pp0") and ph.get("basis") == "pkg" else "")
+            flag = " !" if instability_note(ph) else ""
+            L.append(f"  {kind}: {fmt_ppw(ph, ph['ppw'])} ({BASIS_LABELS[ph['basis']]}{cores}){flag}")
         else:
             L.append(f"  {kind}: PPW не измерен (нет датчика мощности)")
+    if any(instability_note(ph) for ph in phases):
+        L.append("  ! — мощность в окне была нестабильной, см. фазу")
     L.append(bar)
     L.extend(_legend())
     return "\n".join(L)
@@ -93,6 +110,8 @@ def _legend() -> list[str]:
         "PPW = сколько единиц работы в секунду даёт каждый ватт.",
         "Чем выше — тем эффективнее. Сравнивайте прогоны при одинаковой",
         "длительности, питании от сети и фоновой нагрузке.",
+        "«По ядрам» — PPW по мощности ядер (pp0) без остального кристалла:",
+        "честнее сравнивает P-, E- и LP-E-ядра в однопотоке.",
     ]
 
 
@@ -159,8 +178,8 @@ def build_sweep_report(meta: dict, steps: list[dict], source: str) -> str:
 
 
 SWEEP_CSV_FIELDS = ("limit_w", "applied_w", "phase", "profile", "threads", "work_per_s",
-                    "rate", "rate_unit", "power_w", "pkg_w", "ppw", "ppw_rate",
-                    "freq_mhz", "limit_held", "note")
+                    "rate", "rate_unit", "power_w", "pkg_w", "pp0_w", "ppw", "ppw_rate",
+                    "ppw_pp0_rate", "freq_mhz", "warmup_s", "power_cv", "limit_held", "note")
 
 
 def sweep_rows(steps: list[dict]) -> list[dict]:
@@ -188,6 +207,10 @@ def sweep_rows(steps: list[dict]) -> list[dict]:
                 "pkg_w": f"{ph['pkg_w']:.3f}" if ph.get("pkg_w") else "",
                 "ppw": f"{ph['ppw']:.0f}" if ph.get("ppw") else "",
                 "ppw_rate": f"{ph['ppw'] * k:.0f}" if ph.get("ppw") else "",
+                "pp0_w": f"{ph['pp0_w']:.3f}" if ph.get("pp0_w") else "",
+                "ppw_pp0_rate": f"{ph['ppw_pp0'] * k:.0f}" if ph.get("ppw_pp0") else "",
+                "warmup_s": f"{ph['warmup']:.1f}" if ph.get("warmup") is not None else "",
+                "power_cv": f"{ph['pkg_cv']:.1f}" if ph.get("pkg_cv") is not None else "",
                 "freq_mhz": f"{freq['mhz']:.0f}" if freq.get("mhz") else "",
                 "limit_held": "" if held is None else ("yes" if held else "no"),
                 "note": st.get("note") or "",
@@ -224,7 +247,9 @@ def _header(meta: dict, phases: list[dict], source: str) -> list[str]:
     if meta.get("profile"):
         L.append(f"Профиль питания   : {meta['profile']}")
     L.append(f"Источник мощности : {source}")
-    L.append(f"Длительность      : {meta['duration']:.0f} с на фазу (прогрев {meta['warmup']:.0f} с)")
+    warm = (f"авто, не меньше {meta['warmup']:.0f} с" if meta.get("warmup_auto")
+            else f"{meta['warmup']:.0f} с")
+    L.append(f"Длительность      : {meta['duration']:.0f} с на фазу (прогрев {warm})")
     if meta.get("sweep"):
         L.append(f"Лимиты мощности   : {meta['sweep']}")
         if meta.get("settle"):
@@ -269,6 +294,8 @@ def _phase_lines(ph: dict, basis: str | None) -> list[str]:
         L.append(f"  PPW (вручную)       : {fmt_ppw(ph, ph['ppw'])}")
     if ph["ppw_pkg"]:
         L.append(f"  PPW (пакет)         : {fmt_ppw(ph, ph['ppw_pkg'])}")
+    if ph.get("ppw_pp0"):
+        L.append(f"  PPW (ядра, pp0)     : {fmt_ppw(ph, ph['ppw_pp0'])}")
     if ph["ppw_sys"]:
         L.append(f"  PPW (система)       : {fmt_ppw(ph, ph['ppw_sys'])}")
     stab = []
@@ -278,10 +305,14 @@ def _phase_lines(ph: dict, basis: str | None) -> list[str]:
         stab.append(f"скорость ±{ph['rate_cv']:.1f}%")
     if stab:
         L.append(f"  Стабильность        : {', '.join(stab)}")
+    note = instability_note(ph)
+    if note:
+        L.append(f"  ! {note[0].upper() + note[1:]}")
     freq_line = format_freq(ph.get("freq"), single=ph["threads"] == 1)
     if freq_line:
         L.append(f"  {'Частота ядра' if ph['threads'] == 1 else 'Частота ядер':<20}: {freq_line}")
-    L.append(f"  Окно измерения      : {ph['steady']:.1f} с, {ph['samples']} замеров")
+    L.append(f"  Окно измерения      : {ph['steady']:.1f} с, {ph['samples']} замеров"
+             + (f" (прогрев {ph['warmup']:.0f} с)" if ph.get("warmup") is not None else ""))
     if ph.get("pin_label"):
         L.append(f"  Ядра                : {ph['pin_label']}")
     if ph.get("repeat", 1) > 1:

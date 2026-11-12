@@ -256,6 +256,12 @@ def environment_warnings() -> list[str]:
         )
     if battery_saver_on():
         warns.append("Включён режим экономии заряда (Battery saver) — он режет производительность.")
+    try:
+        from ppwbench import powerlimit
+        warns += powerlimit.plan_limit_warnings(
+            powerlimit.read_plan_settings(), ac_line_status() != 0, core_types() is not None)
+    except Exception:
+        pass
     load = cpu_load_pct(1.0)
     if load is not None and load > 12.0:
         warns.append(

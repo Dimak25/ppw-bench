@@ -423,7 +423,7 @@ def test_menu_st_only_falls_back_to_manual(monkeypatch):
             return "auto"
 
     manual = powerlimit.ManualLimiter()
-    answers = iter(["3", "1", "2"])  # только однопоток, 20 с, стандартные ступени
+    answers = iter(["4", "1", "2"])  # только однопоток, 20 с, стандартные ступени
     monkeypatch.setattr("builtins.input", lambda _p="": next(answers))
     res = cli.interactive_menu(object(), {"p": [0], "e": [1]}, 10, Auto(), 0, manual)
     assert res["limiter"] is manual

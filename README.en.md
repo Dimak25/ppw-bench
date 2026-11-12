@@ -157,15 +157,23 @@ py ppw_bench.py --list          :: list power sensors and exit
 
 Or double-click `run.bat` / `ppw-bench.exe`.
 
-With no arguments a two-step interactive menu opens:
+With no arguments an interactive menu opens:
 
-1. **Which test:** whole CPU (multi-thread + single-thread on each core type:
-   P / E / LP-E), multi-thread only, single-thread only, or instruction sets
-   (scalar, AVX2+FMA, AES-NI). Power sensors can be shown from here too.
-2. **Seconds per phase:** 20, 60 or 120 s — the same for every phase. The
+1. **Which test:**
+   * whole CPU — multi-thread + single-thread on each core type (P / E / LP-E);
+   * multi-thread only — all threads at once;
+   * multi-thread per core type — all P-, then all E-, then all LP-E-cores
+     (hybrid CPUs only);
+   * single-thread only — on each core type.
+
+   Power sensors can be shown from here too.
+2. **Instruction sets:** scalar only, all sets, AVX2+FMA only or AES-NI only
+   (see [below](#instruction-sets-avx2fma-aes-ni)). Every selected phase runs
+   on every chosen set. Shown when the CPU supports more than the scalar load.
+3. **Seconds per phase:** 20, 60 or 120 s — the same for every phase. The
    phase count and estimated total time are shown next to each option.
-3. **Power sweep:** no, the default 5–45 W steps, or your own (see
-   [below](#power-sweep)). On Windows, step 4 then picks automatic or manual
+4. **Power sweep:** no, the default 5–45 W steps, or your own (see
+   [below](#power-sweep)). On Windows, step 5 then picks automatic or manual
    limits.
 
 After the test the app asks whether to save the `.txt` report and keeps the
@@ -178,9 +186,11 @@ window open.
 | `--threads N` | threads in the multi-thread phase (default: all) |
 | `--no-st` | multi-thread phase only |
 | `--only-st` | single-thread phase only |
+| `--warmup auto\|N` | warm-up at the start of a phase: `auto` (default) — until power settles, but at least 25 % of the phase; `N` — exactly N s |
 | `--cooldown N` | pause between phases in seconds (default 10, 0 = none) |
 | `--pin MODE` | cores for the single-thread phase: `auto` (default), `p`, `e`, `lpe`, `all` (a separate phase on each core type), `none` or a CPU list (`0,2,4-7`) |
-| `--isa LIST` | multi-thread workload: `scalar` (default), `avx2`, `aes` or `all` — see [below](#instruction-sets-avx2fma-aes-ni) |
+| `--isa LIST` | instruction sets: `scalar` (default), `avx2`, `aes` or `all`; every phase (MT and ST) runs on every set — see [below](#instruction-sets-avx2fma-aes-ni) |
+| `--mt-pin MODE` | cores for the multi-thread phase: `none` (all, default), `all` (all P-, all E-, all LP-E-cores separately), `p`, `e`, `lpe` or a CPU list |
 | `--repeat N` | run each phase N times; the report shows medians and the run-to-run spread |
 | `--watts N` | use a fixed CPU wattage (no sensors available) |
 | `--sweep W,W,...` | power sweep: run the phases at each power limit, e.g. `5,8,10,15,20,28,35,45` |
@@ -204,15 +214,19 @@ workload there are profiles that stress specific core units:
 | `aes` | AES-128 encryption, 8 blocks in parallel: disks, VPN, archives | GB/s (1 unit = 128 bytes) |
 
 ```bat
-ppw-bench.exe --isa all --no-st --duration 30
+ppw-bench.exe --isa all --pin all --duration 30            :: MT and ST on each core type
+ppw-bench.exe --isa avx2 --mt-pin all --no-st --duration 30 :: AVX2 on all P, all E, all LP-E
 ```
 
 * PPW is reported in the profile's units — **GFLOPS per W**, **GB/s per W** —
   physical quantities comparable with other benchmarks.
-* Profiles run as multi-thread phases; single-thread phases are always `scalar`.
+* Every phase — multi-thread (all cores or per core type) and single-thread on
+  each core type — runs on every selected set, grouped by phase: MT scalar →
+  MT AVX2 → MT AES → ST-P scalar → ST-P AVX2 → … so sets on the same cores are
+  compared under similar conditions.
 * bench detects support itself (CPUID); an unsupported profile is skipped
   with a warning. See `bench --caps`.
-* Menu: "Наборы инструкций" in step 1. Works with the power sweep too (a
+* Menu: step 2 "Наборы инструкций". Works with the power sweep too (a
   GFLOPS/W-vs-limit curve). The Windows auto mode calibrates the frequency cap
   on the scalar workload, so AVX2 power can deviate from the step; such rows
   are marked `!`.
@@ -378,6 +392,30 @@ ppw-bench/
 * Linux: "RAPL found but not readable" — run with `sudo` or install the udev rule.
 * Linux: no `intel-rapl` zones — `sudo modprobe intel_rapl_common`. RAPL is
   usually unavailable inside virtual machines.
+
+## Measurement quality
+
+* **Auto warm-up** (`--warmup auto`, default). The first 25 % of a phase (at
+  least 8 s) is always discarded. If power was still dropping after that — the
+  PL2 boost ended or throttling kicked in — the window starts when power has
+  settled (every second within ±10 % of the final level), keeping at least 30 %
+  of the phase. `--warmup N` uses exactly N seconds, as before.
+* **Unstable power.** If power swings by more than ±10 % in the window or never
+  settles, the phase is marked `!` in the report and the summary. This happens
+  when a phase is shorter than the laptop's boost window (often 28–56 s): the
+  result then depends on phase order — the first phase runs boosted, the next
+  ones don't. Use 60–120 s per phase.
+* **Per-core PPW (pp0)** next to package PPW. Package power includes the idle
+  rest of the die (a few watts), which hides the difference between cores in
+  single-thread: on a Core Ultra 9 185H an E-core looks 2.4x worse than a P-core
+  by package power, but slightly better by core power. Compare P / E / LP-E
+  "по ядрам" (by cores).
+* **Capped cores.** Before the test the app checks whether the power plan limits
+  cores: on Windows the max processor state and max frequency for P-cores and
+  E/LP-E-cores separately (`PROCTHROTTLEMAX`/`PROCFREQMAX` and `…1`), on Linux
+  `scaling_max_freq` below `cpuinfo_max_freq`. Some OEM tools set E-cores to
+  25 % on AC, so they run at ~1 GHz. The warning includes the command that
+  restores it.
 
 ## Tips for comparable results
 

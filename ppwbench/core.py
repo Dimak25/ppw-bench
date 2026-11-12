@@ -167,11 +167,16 @@ def per_second(window: list[dict], key: str, t0: float) -> list[float]:
     Разброс считается по секундам, как и для скорости: отдельные замеры
     раз в 0,2 с ловят мгновенные всплески (фоновые задачи, переходы
     между ядрами) и завышают «нестабильность», особенно в ST-фазе."""
+    return [w for _s, w in per_second_keyed(window, key, t0)]
+
+
+def per_second_keyed(window: list[dict], key: str, t0: float) -> list[tuple[int, float]]:
+    """[(номер секунды от t0, среднее за секунду)] — без пропусков в нумерации."""
     buckets: dict[int, list[float]] = {}
     for s in window:
         if s.get(key) is not None:
             buckets.setdefault(int(s["t"] - t0), []).append(s[key])
-    return [sum(v) / len(v) for _, v in sorted(buckets.items())]
+    return [(k, sum(v) / len(v)) for k, v in sorted(buckets.items())]
 
 
 def window_power(window: list[dict], key: str) -> float | None:
@@ -187,6 +192,35 @@ def window_power(window: list[dict], key: str) -> float | None:
             return w
     vals = [s[key] for s in window if s.get(key) is not None]
     return sum(vals) / len(vals) if vals else None
+
+
+SETTLE_TOL = 0.10        # мощность «установилась»: каждая секунда в ±10 % от итоговой
+UNSTABLE_CV = 10.0       # разброс мощности в окне выше этого, % -> фаза помечается
+MIN_WINDOW_S = 6.0       # окну замера оставляем минимум столько секунд...
+MIN_WINDOW_SHARE = 0.30  # ...и не меньше этой доли фазы
+
+
+def settle_time(per_sec: list[tuple[int, float]], t_min: float, t_max: float,
+                tol: float = SETTLE_TOL) -> tuple[float, bool]:
+    """Когда мощность вышла на установившийся уровень.
+
+    per_sec — [(секунда от старта фазы, средняя мощность)]. Ищем первую
+    секунду s в [t_min, t_max], после которой каждая секунда отличается от
+    итогового уровня (медиана хвоста после t_max) не больше чем на tol.
+    Так из окна выпадает конец буста PL2 или скачок троттлинга.
+    Возвращает (прогрев, удалось ли найти); если не удалось — (t_min, False)."""
+    tail = [w for s, w in per_sec if s >= t_max]
+    if len(tail) < 2:
+        return t_min, True
+    ref = statistics.median(tail)
+    if ref <= 0:
+        return t_min, True
+    start = int(t_min) if t_min == int(t_min) else int(t_min) + 1
+    for s in range(start, int(t_max) + 1):
+        rest = [w for k, w in per_sec if k >= s]
+        if rest and all(abs(w / ref - 1) <= tol for w in rest):
+            return float(max(s, t_min)), True
+    return t_min, False
 
 
 def summarize_probe(probes: list[tuple[int, float]],
@@ -249,9 +283,12 @@ def bench_profiles(exe: Path) -> list[str]:
 
 def run_phase(exe: Path, threads: int, duration: float, sampler: Sampler,
               backend=None, cpus: list[int] | None = None,
-              tiers: dict[str, list[int]] | None = None, profile: str = "scalar") -> dict:
+              tiers: dict[str, list[int]] | None = None, profile: str = "scalar",
+              warmup: float | None = None) -> dict:
     """Один прогон bench. cpus — ограничить bench этими логическими CPU,
-    profile — нагрузка (scalar, avx2, aes)."""
+    profile — нагрузка (scalar, avx2, aes), warmup — прогрев, с; None — авто:
+    не меньше warmup_seconds(), а если мощность в начале ещё падала (конец
+    буста PL2, троттлинг) — до момента, когда она установилась."""
     args = [str(exe), str(threads), f"{duration:.3f}"]
     if profile != "scalar":
         args += ["0", profile]  # 0 — размер внутреннего цикла по умолчанию
@@ -324,11 +361,24 @@ def run_phase(exe: Path, threads: int, duration: float, sampler: Sampler,
         raise RuntimeError("бенчмарк не сообщил START/DONE")
 
     # окно установившегося режима: отбрасываем прогрев и хвост
-    warmup = warmup_seconds(duration)
-    w_start = t_start + warmup
     w_end = t_end - 0.3
+    run_s = w_end - t_start
+    settled = None  # None — авто-прогрев не применялся
+    if warmup is None:
+        base = warmup_seconds(duration)
+        latest = run_s - max(MIN_WINDOW_S, duration * MIN_WINDOW_SHARE)
+        if latest > base:
+            key = "pkg" if any(s.get("pkg") is not None for s in sampler.samples
+                               if t_start <= s["t"] <= w_end) else "sys"
+            phase = [s for s in sampler.samples if t_start <= s["t"] <= w_end]
+            per_sec = per_second_keyed(phase, key, t_start)
+            warmup, settled = settle_time(per_sec, base, latest)
+        else:
+            warmup = base
+    w_start = t_start + warmup
     if w_end <= w_start:
         w_start, w_end = t_start + duration * 0.3, t_end
+        warmup = duration * 0.3
 
     work0 = interp_work(ticks, (w_start - t_start) * 1000.0)
     work1 = interp_work(ticks, (w_end - t_start) * 1000.0)
@@ -370,7 +420,10 @@ def run_phase(exe: Path, threads: int, duration: float, sampler: Sampler,
         "pkg_cv": coeff_var(per_second(window, "pkg", w_start)),
         "rate_cv": coeff_var(rates),
         "ppw_pkg": work_per_s / pkg if pkg else None,
+        "ppw_pp0": work_per_s / pp0 if pp0 else None,
         "ppw_sys": work_per_s / sysw if sysw else None,
+        "warmup": warmup,
+        "settled": settled,
         # заполняются в apply_power_basis()
         "basis": None,
         "power_w": None,
@@ -412,7 +465,8 @@ def apply_power_basis(res: dict, manual: float | None) -> dict:
 
 MEDIAN_KEYS = (
     "steady", "total_work", "work_per_s", "pkg_w", "pp0_w", "sys_w", "pkg_cv",
-    "rate_cv", "ppw_pkg", "ppw_sys", "power_w", "ppw", "energy_j", "samples",
+    "rate_cv", "ppw_pkg", "ppw_pp0", "ppw_sys", "power_w", "ppw", "energy_j", "samples",
+    "warmup",
 )
 
 
@@ -436,6 +490,8 @@ def aggregate_runs(runs: list[dict]) -> dict:
         res[key] = _median([r.get(key) for r in runs])
     if res.get("samples") is not None:
         res["samples"] = int(res["samples"])
+    flags = [r.get("settled") for r in runs if r.get("settled") is not None]
+    res["settled"] = all(flags) if flags else None
     freqs = [r["freq"] for r in runs if r.get("freq")]
     if freqs:
         agg = dict(freqs[len(freqs) // 2])
