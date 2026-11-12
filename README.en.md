@@ -160,8 +160,8 @@ Or double-click `run.bat` / `ppw-bench.exe`.
 With no arguments a two-step interactive menu opens:
 
 1. **Which test:** whole CPU (multi-thread + single-thread on each core type:
-   P / E / LP-E), multi-thread only or single-thread only. Power sensors can
-   be shown from here too.
+   P / E / LP-E), multi-thread only, single-thread only, or instruction sets
+   (scalar, AVX2+FMA, AES-NI). Power sensors can be shown from here too.
 2. **Seconds per phase:** 20, 60 or 120 s — the same for every phase. The
    phase count and estimated total time are shown next to each option.
 3. **Power sweep:** no, the default 5–45 W steps, or your own (see
@@ -180,6 +180,7 @@ window open.
 | `--only-st` | single-thread phase only |
 | `--cooldown N` | pause between phases in seconds (default 10, 0 = none) |
 | `--pin MODE` | cores for the single-thread phase: `auto` (default), `p`, `e`, `lpe`, `all` (a separate phase on each core type), `none` or a CPU list (`0,2,4-7`) |
+| `--isa LIST` | multi-thread workload: `scalar` (default), `avx2`, `aes` or `all` — see [below](#instruction-sets-avx2fma-aes-ni) |
 | `--repeat N` | run each phase N times; the report shows medians and the run-to-run spread |
 | `--watts N` | use a fixed CPU wattage (no sensors available) |
 | `--sweep W,W,...` | power sweep: run the phases at each power limit, e.g. `5,8,10,15,20,28,35,45` |
@@ -189,6 +190,38 @@ window open.
 | `--list` | list detected sensors and exit |
 | `--interactive` | open the interactive menu |
 | `--version` | print the version and exit |
+
+### Instruction sets (AVX2+FMA, AES-NI)
+
+Instruction classes differ a lot in power: wide vector FMAs load a core the
+most, but do several times more work per clock. Besides the general-purpose
+workload there are profiles that stress specific core units:
+
+| Profile | What it stresses | Rate unit |
+|---------|------------------|-----------|
+| `scalar` | general integer + FP code (default workload) | units/s |
+| `avx2` | 256-bit FMA (FP32): science, rendering, codecs | GFLOPS (1 unit = 192 FLOP) |
+| `aes` | AES-128 encryption, 8 blocks in parallel: disks, VPN, archives | GB/s (1 unit = 128 bytes) |
+
+```bat
+ppw-bench.exe --isa all --no-st --duration 30
+```
+
+* PPW is reported in the profile's units — **GFLOPS per W**, **GB/s per W** —
+  physical quantities comparable with other benchmarks.
+* Profiles run as multi-thread phases; single-thread phases are always `scalar`.
+* bench detects support itself (CPUID); an unsupported profile is skipped
+  with a warning. See `bench --caps`.
+* Menu: "Наборы инструкций" in step 1. Works with the power sweep too (a
+  GFLOPS/W-vs-limit curve). The Windows auto mode calibrates the frequency cap
+  on the scalar workload, so AVX2 power can deviate from the step; such rows
+  are marked `!`.
+* On hybrid CPUs AES-NI throughput fluctuates noticeably (±15 %): the scheduler
+  and Thread Director move such threads between cores. That is platform
+  behaviour, not measurement error.
+* **Workload version 2** (since ppw-bench 1.8): the scalar FP chain no longer
+  overflows to `inf`, per-thread counters are cache-line aligned. Version 1
+  and 2 "units/s" scores are not comparable — the version is in the report.
 
 ### Hybrid CPUs and repeats
 

@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ppwbench import util
-from ppwbench.core import BASIS_LABELS
+from ppwbench.core import BASIS_LABELS, PROFILE_LABELS
 from ppwbench.cpusets import TIER_NAMES, TIER_ORDER
 from ppwbench.util import fmt_si
 
@@ -19,6 +19,38 @@ ENERGY_TAGS = {"pkg": "пакет", "sys": "система", "manual": "вруч
 BAR = "=" * 66
 DASH = "-" * 66
 
+# единица скорости -> единица работы за тест
+TOTAL_UNITS = {"FLOPS": "FLOP", "B/s": "B"}
+
+
+def _unit(ph: dict) -> tuple[str, float]:
+    """(единица скорости, сколько её в одной единице работы bench)."""
+    u = ph.get("unit")
+    return (u[0], float(u[1])) if u else ("ед/с", 1.0)
+
+
+def fmt_rate(ph: dict, work_per_s: float | None) -> str:
+    """Скорость фазы в её единицах: «3.4 Gед/с», «612 GFLOPS», «64 GB/s»."""
+    name, k = _unit(ph)
+    return fmt_si(None if work_per_s is None else work_per_s * k, name)
+
+
+def fmt_ppw(ph: dict, ppw: float | None, short: bool = False) -> str:
+    """PPW в единицах фазы: «110 Mед/с на Вт», «25 GFLOPS на Вт»."""
+    name, k = _unit(ph)
+    return fmt_si(None if ppw is None else ppw * k, name + ("/Вт" if short else " на Вт"))
+
+
+def fmt_total(ph: dict, work: float) -> str:
+    name, k = _unit(ph)
+    return fmt_si(work * k, TOTAL_UNITS.get(name, "ед"))
+
+
+def profile_label(ph: dict) -> str | None:
+    """Подпись профиля нагрузки для фаз с особым набором инструкций."""
+    prof = ph.get("profile")
+    return PROFILE_LABELS.get(prof, prof) if prof and prof != "scalar" else None
+
 
 def build_report(meta: dict, phases: list[dict], source: str) -> str:
     L = _header(meta, phases, source)
@@ -26,6 +58,8 @@ def build_report(meta: dict, phases: list[dict], source: str) -> str:
 
     for i, ph in enumerate(phases, 1):
         kind = "MULTI-THREAD" if ph["threads"] > 1 else "SINGLE-THREAD"
+        if profile_label(ph):
+            kind += f", {profile_label(ph)}"
         if ph.get("core_kind"):
             kind += f", {ph['core_kind']}-ядро"
         basis = ph.get("basis")
@@ -37,7 +71,7 @@ def build_report(meta: dict, phases: list[dict], source: str) -> str:
     for ph in phases:
         kind = phase_name(ph)
         if ph.get("ppw"):
-            L.append(f"  {kind}: {fmt_si(ph['ppw'], 'ед/с на Вт')} ({BASIS_LABELS[ph['basis']]})")
+            L.append(f"  {kind}: {fmt_ppw(ph, ph['ppw'])} ({BASIS_LABELS[ph['basis']]})")
         else:
             L.append(f"  {kind}: PPW не измерен (нет датчика мощности)")
     L.append(bar)
@@ -46,10 +80,11 @@ def build_report(meta: dict, phases: list[dict], source: str) -> str:
 
 
 def phase_name(ph: dict) -> str:
-    """"MT", "ST", "ST (P)" ..."""
+    """"MT", "ST", "ST (P)", "MT (AVX2+FMA)" ..."""
     kind = "MT" if ph["threads"] > 1 else "ST"
-    if ph.get("core_kind"):
-        kind += f" ({ph['core_kind']})"
+    extra = [x for x in (profile_label(ph), ph.get("core_kind")) if x]
+    if extra:
+        kind += f" ({', '.join(extra)})"
     return kind
 
 
@@ -69,7 +104,7 @@ def build_sweep_report(meta: dict, steps: list[dict], source: str) -> str:
     if not steps:
         L.append("  Ни одна ступень не была снята.")
     else:
-        L.append(f"  {'Лимит':<8}{'Фаза':<11}{'Скорость':<15}{'Мощность':<10}"
+        L.append(f"  {'Лимит':<8}{'Фаза':<15}{'Скорость':<16}{'Мощность':<10}"
                  f"{'PPW':<19}{'Частота'}")
         flagged = False
         for st in steps:
@@ -88,8 +123,8 @@ def build_sweep_report(meta: dict, steps: list[dict], source: str) -> str:
                     flagged = True
                 freq = ph.get("freq")
                 ghz = f"{freq['mhz'] / 1000:.2f} ГГц" if freq and freq.get("mhz") else ""
-                ppw = fmt_si(ph["ppw"], "ед/с/Вт") if ph.get("ppw") else "n/a"
-                L.append(f"  {limit:<8}{phase_name(ph):<11}{fmt_si(ph['work_per_s'], 'ед/с'):<15}"
+                ppw = fmt_ppw(ph, ph["ppw"], short=True) if ph.get("ppw") else "n/a"
+                L.append(f"  {limit:<8}{phase_name(ph):<15}{fmt_rate(ph, ph['work_per_s']):<16}"
                          f"{power + mark:<10}{ppw:<19}{ghz}".rstrip())
         if flagged:
             L.append("  ! — средняя мощность пакета выше лимита больше чем на 10 %:")
@@ -114,7 +149,7 @@ def build_sweep_report(meta: dict, steps: list[dict], source: str) -> str:
         best = max(held or cands, key=lambda c: c[1]["ppw"], default=None)
         if best:
             note = "" if held else " (лимит нигде не соблюдался)"
-            L.append(f"  {name}: {fmt_si(best[1]['ppw'], 'ед/с на Вт')} "
+            L.append(f"  {name}: {fmt_ppw(best[1], best[1]['ppw'])} "
                      f"при лимите {best[0]:g} Вт{note}")
         else:
             L.append(f"  {name}: PPW не измерен (нет датчика мощности)")
@@ -123,8 +158,9 @@ def build_sweep_report(meta: dict, steps: list[dict], source: str) -> str:
     return "\n".join(L)
 
 
-SWEEP_CSV_FIELDS = ("limit_w", "applied_w", "phase", "threads", "work_per_s",
-                    "power_w", "pkg_w", "ppw", "freq_mhz", "limit_held", "note")
+SWEEP_CSV_FIELDS = ("limit_w", "applied_w", "phase", "profile", "threads", "work_per_s",
+                    "rate", "rate_unit", "power_w", "pkg_w", "ppw", "ppw_rate",
+                    "freq_mhz", "limit_held", "note")
 
 
 def sweep_rows(steps: list[dict]) -> list[dict]:
@@ -138,15 +174,20 @@ def sweep_rows(steps: list[dict]) -> list[dict]:
         for ph in st["phases"]:
             freq = ph.get("freq") or {}
             held = ph.get("limit_held")
+            unit, k = _unit(ph)
             rows.append({
                 "limit_w": f"{st['target']:g}",
                 "applied_w": f"{st['applied']:g}",
                 "phase": phase_name(ph),
+                "profile": ph.get("profile") or "scalar",
                 "threads": ph["threads"],
                 "work_per_s": f"{ph['work_per_s']:.0f}",
+                "rate": f"{ph['work_per_s'] * k:.0f}",
+                "rate_unit": unit,
                 "power_w": f"{ph['power_w']:.3f}" if ph.get("power_w") else "",
                 "pkg_w": f"{ph['pkg_w']:.3f}" if ph.get("pkg_w") else "",
                 "ppw": f"{ph['ppw']:.0f}" if ph.get("ppw") else "",
+                "ppw_rate": f"{ph['ppw'] * k:.0f}" if ph.get("ppw") else "",
                 "freq_mhz": f"{freq['mhz']:.0f}" if freq.get("mhz") else "",
                 "limit_held": "" if held is None else ("yes" if held else "no"),
                 "note": st.get("note") or "",
@@ -195,6 +236,9 @@ def _header(meta: dict, phases: list[dict], source: str) -> list[str]:
     build = next((ph.get("build") for ph in phases if ph.get("build")), None)
     if build:
         L.append(f"Сборка bench      : {build}")
+    workload = next((ph.get("workload") for ph in phases if ph.get("workload")), None)
+    if workload:
+        L.append(f"Версия нагрузки   : {workload} (баллы «ед/с» сравнимы только при одной версии)")
     if meta.get("version"):
         L.append(f"Версия ppw-bench  : {meta['version']}")
     if meta.get("warnings"):
@@ -209,8 +253,8 @@ def _header(meta: dict, phases: list[dict], source: str) -> list[str]:
 def _phase_lines(ph: dict, basis: str | None) -> list[str]:
     """Подробности одной фазы (без заголовка и разделителя)."""
     L: list[str] = []
-    L.append(f"  Производительность  : {fmt_si(ph['work_per_s'], 'ед/с')}")
-    L.append(f"  Работа за тест      : {fmt_si(ph['total_work'], 'ед')}")
+    L.append(f"  Производительность  : {fmt_rate(ph, ph['work_per_s'])}")
+    L.append(f"  Работа за тест      : {fmt_total(ph, ph['total_work'])}")
     if basis == "manual":
         L.append(f"  Мощность (вручную)  : {ph['power_w']:.2f} Вт")
     if ph["pkg_w"]:
@@ -222,11 +266,11 @@ def _phase_lines(ph: dict, basis: str | None) -> list[str]:
     if ph["energy_j"] and basis:
         L.append(f"  {'Энергия (' + ENERGY_TAGS[basis] + ')':<20}: {ph['energy_j']:.0f} Дж")
     if basis == "manual":
-        L.append(f"  PPW (вручную)       : {fmt_si(ph['ppw'], 'ед/с на Вт')}")
+        L.append(f"  PPW (вручную)       : {fmt_ppw(ph, ph['ppw'])}")
     if ph["ppw_pkg"]:
-        L.append(f"  PPW (пакет)         : {fmt_si(ph['ppw_pkg'], 'ед/с на Вт')}")
+        L.append(f"  PPW (пакет)         : {fmt_ppw(ph, ph['ppw_pkg'])}")
     if ph["ppw_sys"]:
-        L.append(f"  PPW (система)       : {fmt_si(ph['ppw_sys'], 'ед/с на Вт')}")
+        L.append(f"  PPW (система)       : {fmt_ppw(ph, ph['ppw_sys'])}")
     stab = []
     if ph["pkg_cv"] is not None:
         stab.append(f"мощность ±{ph['pkg_cv']:.1f}%")
@@ -242,7 +286,9 @@ def _phase_lines(ph: dict, basis: str | None) -> list[str]:
         L.append(f"  Ядра                : {ph['pin_label']}")
     if ph.get("repeat", 1) > 1:
         is_ppw = ph["runs_metric"] == "ppw"
-        series = _fmt_series(ph["runs_values"], "ед/с на Вт" if is_ppw else "ед/с")
+        unit, k = _unit(ph)
+        series = _fmt_series([v * k for v in ph["runs_values"]],
+                             f"{unit} на Вт" if is_ppw else unit)
         spread = f", разброс ±{ph['runs_cv']:.1f}%" if ph.get("runs_cv") is not None else ""
         L.append(f"  {'Повторы (' + str(ph['repeat']) + ')':<20}: "
                  f"{'PPW' if is_ppw else 'скорость'} {series}{spread}")

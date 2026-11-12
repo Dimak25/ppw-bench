@@ -1,3 +1,3 @@
 """PPW Bench — измерение Performance-per-Watt (PPW) для CPU (Windows и Linux)."""
 
-__version__ = "1.7.1"
+__version__ = "1.8.0"

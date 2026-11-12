@@ -8,6 +8,7 @@
     ppw-bench --watts 45            # если датчиков нет: задать мощность вручную
     ppw-bench --list                # показать найденные датчики и выйти
     sudo ppw-bench --sweep 5,10,15,25 --duration 30   # PPW на разных лимитах (Linux)
+    ppw-bench --isa all --no-st     # MT на каждом наборе инструкций: обычный, AVX2, AES
 """
 
 from __future__ import annotations
@@ -22,7 +23,6 @@ from datetime import datetime
 from ppwbench import __version__, core, powerlimit, report, util
 from ppwbench.cpusets import TIER_NAMES, TIER_ORDER, format_cpulist, parse_cpulist
 from ppwbench.platforms import current as current_backend
-from ppwbench.util import fmt_si
 
 DEFAULT_COOLDOWN = 10.0
 DEFAULT_SETTLE = 10.0
@@ -42,12 +42,17 @@ SUITES = {
     "cpu": ("Весь процессор", True, True),
     "mt": ("Только многопоток", True, False),
     "st": ("Только однопоток", False, True),
+    "isa": ("Наборы инструкций", True, False),
 }
 MENU_DURATIONS = (20.0, 60.0, 120.0)
 
 
-def suite_phase_count(suite: str, tiers: dict[str, list[int]] | None) -> int:
-    """Сколько фаз будет в наборе: MT + по одной ST на каждый тип ядер."""
+def suite_phase_count(suite: str, tiers: dict[str, list[int]] | None,
+                      profiles: int = 1) -> int:
+    """Сколько фаз будет в наборе: MT + по одной ST на каждый тип ядер;
+    для наборов инструкций — по одной MT-фазе на профиль."""
+    if suite == "isa":
+        return profiles
     _label, mt, st = SUITES[suite]
     st_count = sum(1 for t in TIER_ORDER if tiers.get(t)) if tiers else 1
     return int(mt) + (st_count if st else 0)
@@ -151,40 +156,43 @@ def _ask_sweep(limiter, phases: int, duration: float, cooldown: float,
 
 def interactive_menu(reader, tiers: dict[str, list[int]] | None,
                      cooldown: float = DEFAULT_COOLDOWN, limiter=None,
-                     settle: float = DEFAULT_SETTLE, manual=None) -> dict | None:
+                     settle: float = DEFAULT_SETTLE, manual=None,
+                     profiles: list[str] | None = None) -> dict | None:
     """Интерактивное меню: какой набор тестов, сколько секунд на фазу и (если
     передан limiter) нужен ли ступенчатый замер мощности и как ставить лимит.
 
     Возвращает {"suite", "duration", "pin", "no_st", "only_st", "sweep",
-    "limiter"} либо None (выход). На гибридных CPU однопоточная фаза идёт на
-    каждом типе ядер."""
+    "limiter", "isa"} либо None (выход). На гибридных CPU однопоточная фаза
+    идёт на каждом типе ядер. profiles — профили нагрузки, которые умеет CPU."""
+    profiles = profiles or ["scalar"]
     st_desc = _st_desc(tiers)
     descs = {
         "cpu": f"многопоток + {st_desc}",
         "mt": "все потоки",
         "st": st_desc,
+        "isa": "многопоток: " + ", ".join(core.PROFILE_LABELS[p] for p in profiles),
     }
-    suite_keys = {"1": "cpu", "2": "mt", "3": "st"}
+    suite_keys = {"1": "cpu", "2": "mt", "3": "st", "4": "isa"}
     print(f"PPW Bench {__version__} — интерактивный режим")
     print()
     while True:
         print("Шаг 1. Какой тест запустить?")
         for num, key in suite_keys.items():
             print(f"  {num}. {SUITES[key][0]:<18} — {descs[key]}")
-        print("  4. Показать датчики мощности")
+        print("  5. Показать датчики мощности")
         print("  0. Выход")
-        choice = util.ask_choice("Выбор [1]: ", {"0", "1", "2", "3", "4"}, "1")
+        choice = util.ask_choice("Выбор [1]: ", {"0", "1", "2", "3", "4", "5"}, "1")
         print()
         if choice == "0":
             return None
-        if choice == "4":
+        if choice == "5":
             print_sensors(reader)
             print()
             util.pause("Нажмите Enter, чтобы вернуться в меню...")
             print()
             continue
         suite = suite_keys[choice]
-        phases = suite_phase_count(suite, tiers)
+        phases = suite_phase_count(suite, tiers, len(profiles))
 
         print("Шаг 2. Сколько секунд на каждую фазу?")
         for i, d in enumerate(MENU_DURATIONS, 1):
@@ -210,6 +218,7 @@ def interactive_menu(reader, tiers: dict[str, list[int]] | None,
             "duration": duration,
             "sweep": sweep,
             "limiter": chosen_limiter,
+            "isa": list(profiles) if suite == "isa" else ["scalar"],
             "pin": "all" if st and tiers else "auto",
             "no_st": not st,
             "only_st": not mt,
@@ -275,10 +284,36 @@ def resolve_st(mode: str, backend) -> tuple[list[dict], list[str]]:
     return [dict(plain, cpus=cpus, label=f"CPU {format_cpulist(cpus)}")], []
 
 
+def resolve_isa(requested: list[str], supported: list[str]) -> tuple[list[str], list[str]]:
+    """--isa -> (профили MT-фаз в порядке PROFILES, предупреждения о неподдерживаемых)."""
+    if "all" in requested:
+        return [p for p in core.PROFILES if p in supported], []
+    out, warns = [], []
+    for p in core.PROFILES:
+        if p not in requested:
+            continue
+        if p in supported:
+            out.append(p)
+        else:
+            warns.append(f"--isa {p}: {core.PROFILE_LABELS[p]} не поддерживается этим CPU — "
+                         "фаза пропущена.")
+    return out, warns
+
+
 def resolve_pin(mode: str, backend) -> tuple[list[int] | None, str, list[str]]:
     """Совместимость: одна ST-фаза -> (CPU, подпись, предупреждения)."""
     phases, warns = resolve_st(mode, backend)
     return phases[0]["cpus"], phases[0]["label"], warns
+
+
+def isa_arg(value: str) -> list[str]:
+    """--isa scalar,avx2,aes | all -> список профилей (all раскрывается позже)."""
+    names = [v.strip().lower() for v in value.split(",") if v.strip()]
+    bad = [n for n in names if n not in core.PROFILES + ("all",)]
+    if not names or bad:
+        raise argparse.ArgumentTypeError(
+            f"ожидается all или список из {', '.join(core.PROFILES)} (получено {value!r})")
+    return names
 
 
 def sweep_arg(value: str) -> list[float]:
@@ -330,6 +365,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="ядра для single-thread фазы: auto (P-ядра на гибридных CPU), "
                          "p, e, lpe, all (отдельная фаза на каждом типе ядер), none "
                          "или список CPU, например 0,2,4-7")
+    ap.add_argument("--isa", type=isa_arg, default=["scalar"], metavar="LIST",
+                    help="нагрузка многопоточной фазы: scalar (обычный код), avx2 (AVX2+FMA, "
+                         "GFLOPS), aes (AES-NI, GB/s) или all — по фазе на каждый "
+                         "поддерживаемый; однопоточные фазы всегда scalar")
     ap.add_argument("--repeat", type=int, default=1,
                     help="повторить каждую фазу N раз; в отчёте медианы и разброс")
     ap.add_argument("--watts", type=float, default=None,
@@ -436,9 +475,12 @@ def main() -> int:
     manual_alt = (powerlimit.ManualLimiter()
                   if backend.NAME == "Windows" and limiter.mode != "manual" else None)
     sweep = args.sweep
+    exe = core.ensure_bench(backend)
+    supported = core.bench_profiles(exe)
+    isa = args.isa
     if interactive:
         chosen = interactive_menu(reader, backend.core_types(), args.cooldown, limiter,
-                                  args.settle, manual_alt)
+                                  args.settle, manual_alt, supported)
         if chosen is None:
             return 0
         duration = chosen["duration"]
@@ -447,6 +489,7 @@ def main() -> int:
         args.only_st = chosen["only_st"]
         sweep = chosen["sweep"]
         limiter = chosen["limiter"] or limiter
+        isa = chosen["isa"]
     else:
         if duration < 8:
             ap.error("--duration должен быть >= 8 секунд")
@@ -466,8 +509,6 @@ def main() -> int:
 
     logical = backend.logical_cpus()
     mt_threads = args.threads if args.threads > 0 else logical
-
-    exe = core.ensure_bench(backend)
 
     # источник мощности
     manual = args.watts
@@ -492,12 +533,18 @@ def main() -> int:
 
     st_phases, pin_warnings = resolve_st(pin_mode, backend)
     warnings += pin_warnings
+    profiles, isa_warnings = resolve_isa(isa, supported)
+    warnings += isa_warnings
+    if not profiles and args.only_st is False and args.no_st:
+        ap.error("--isa: ни один из выбранных профилей не поддерживается этим CPU")
     phases_spec: list[dict] = []
     if not args.only_st:
-        phases_spec.append({"tag": "MT", "threads": mt_threads, "cpus": None,
-                            "label": None, "core_kind": None})
+        for prof in profiles:
+            phases_spec.append({"tag": "MT" if prof == "scalar" else f"MT-{prof.upper()}",
+                                "threads": mt_threads, "cpus": None, "label": None,
+                                "core_kind": None, "profile": prof})
     if not args.no_st:
-        phases_spec += [dict(ph, threads=1) for ph in st_phases]
+        phases_spec += [dict(ph, threads=1, profile="scalar") for ph in st_phases]
     if sweep and getattr(limiter, "mt_only", False):
         dropped = [ph for ph in phases_spec if ph["threads"] == 1]
         phases_spec = [ph for ph in phases_spec if ph["threads"] > 1]
@@ -564,13 +611,15 @@ def main() -> int:
                 core.cooldown(cooldown)
             threads, tag, cpus = ph["threads"], ph["tag"], ph["cpus"]
             label = "MULTI-THREAD" if threads > 1 else "SINGLE-THREAD"
+            if ph["profile"] != "scalar":
+                label += f", {core.PROFILE_LABELS[ph['profile']]}"
             if ph["core_kind"]:
                 label += f", {ph['core_kind']}-ядро"
             rep = f" #{r + 1}/{repeat}" if repeat > 1 else ""
             print(f"[{tag}{rep}] {label}, {threads} поток(ов), {duration:.0f} с ...", flush=True)
             res = core.apply_power_basis(
                 core.run_phase(exe, threads, duration, sampler, backend=backend, cpus=cpus,
-                               tiers=tiers),
+                               tiers=tiers, profile=ph["profile"]),
                 manual,
             )
             res["tag"] = tag
@@ -586,9 +635,9 @@ def main() -> int:
             power = res["power_w"]
             freq = res.get("freq")
             print(
-                f"     {fmt_si(res['work_per_s'], 'ед/с')}"
+                f"     {report.fmt_rate(res, res['work_per_s'])}"
                 + (f"   {power:.1f} Вт" if power else "")
-                + (f"   PPW {fmt_si(ppw, 'ед/с на Вт')}" if ppw else "")
+                + (f"   PPW {report.fmt_ppw(res, ppw)}" if ppw else "")
                 + (f"   {freq['mhz'] / 1000:.2f} ГГц" if freq else ""),
                 flush=True,
             )

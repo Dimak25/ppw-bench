@@ -215,14 +215,50 @@ def summarize_probe(probes: list[tuple[int, float]],
     return out
 
 
+# Профили нагрузки bench (наборы инструкций). scalar — обычный код общего
+# назначения; остальные — узкие нагрузки на конкретные блоки ядра.
+PROFILES = ("scalar", "avx2", "aes")
+PROFILE_LABELS = {"scalar": "обычный", "avx2": "AVX2+FMA", "aes": "AES-NI"}
+PROFILE_DESCS = {
+    "scalar": "целочисленный и FP-код общего назначения",
+    "avx2": "векторная FP32: 256-битные FMA (наука, рендер, кодеки)",
+    "aes": "шифрование AES-128 (диски, VPN, архивы)",
+}
+
+_caps_cache: dict[str, list[str]] = {}
+
+
+def bench_profiles(exe: Path) -> list[str]:
+    """Профили, которые bench может выполнить на этом CPU (bench --caps).
+
+    Старый bench без --caps умеет только scalar."""
+    key = str(exe)
+    if key not in _caps_cache:
+        profiles = ["scalar"]
+        try:
+            out = subprocess.run([key, "--caps"], capture_output=True, text=True,
+                                 timeout=10).stdout
+            for line in out.splitlines():
+                if line.startswith("CAPS "):
+                    profiles = [p for p in line.split()[1:] if p in PROFILES] or profiles
+        except (OSError, subprocess.SubprocessError):
+            pass
+        _caps_cache[key] = profiles
+    return _caps_cache[key]
+
+
 def run_phase(exe: Path, threads: int, duration: float, sampler: Sampler,
               backend=None, cpus: list[int] | None = None,
-              tiers: dict[str, list[int]] | None = None) -> dict:
-    """Один прогон bench. cpus — ограничить bench этими логическими CPU."""
+              tiers: dict[str, list[int]] | None = None, profile: str = "scalar") -> dict:
+    """Один прогон bench. cpus — ограничить bench этими логическими CPU,
+    profile — нагрузка (scalar, avx2, aes)."""
+    args = [str(exe), str(threads), f"{duration:.3f}"]
+    if profile != "scalar":
+        args += ["0", profile]  # 0 — размер внутреннего цикла по умолчанию
     pin_ctx = backend.pinned(cpus) if (backend is not None and cpus) else contextlib.nullcontext()
     with pin_ctx as applied:
         proc = subprocess.Popen(
-            [str(exe), str(threads), f"{duration:.3f}"],
+            args,
             stdout=subprocess.PIPE,
             # stderr никто не читает: PIPE мог бы переполниться и подвесить bench
             stderr=subprocess.DEVNULL,
@@ -233,6 +269,9 @@ def run_phase(exe: Path, threads: int, duration: float, sampler: Sampler,
     t_start = None
     t_end = None
     build = None
+    workload = None
+    unit = None  # (название, единиц на одну единицу работы), например ("FLOPS", 192)
+    error = None
     probes: list[tuple[int, float]] = []  # (cpu, МГц) из строк FREQ
     ticks: list[tuple[float, float]] = []  # (elapsed_ms, work)
     line_buf = b""
@@ -253,6 +292,12 @@ def run_phase(exe: Path, threads: int, duration: float, sampler: Sampler,
                     t_start = now
                 elif parts[0] == "BUILD":
                     build = line[6:].strip()
+                elif parts[0] == "WORKLOAD" and len(parts) >= 2:
+                    workload = parts[1]
+                elif parts[0] == "UNIT" and len(parts) >= 3:
+                    unit = (parts[1], float(parts[2]))
+                elif parts[0] == "ERROR":
+                    error = line[6:].strip()
                 elif parts[0] == "TICK" and len(parts) >= 3:
                     ticks.append((float(parts[1]), float(parts[2])))
                 elif parts[0] == "STOP" and len(parts) >= 3:
@@ -273,6 +318,8 @@ def run_phase(exe: Path, threads: int, duration: float, sampler: Sampler,
             proc.wait()
         raise
 
+    if error:
+        raise RuntimeError(f"bench: {error}")
     if t_start is None or t_end is None or t_end <= t_start:
         raise RuntimeError("бенчмарк не сообщил START/DONE")
 
@@ -314,6 +361,9 @@ def run_phase(exe: Path, threads: int, duration: float, sampler: Sampler,
         "total_work": total_work,
         "work_per_s": work_per_s,
         "build": build,
+        "workload": workload,
+        "profile": profile,
+        "unit": unit,
         "pkg_w": pkg,
         "pp0_w": pp0,
         "sys_w": sysw,

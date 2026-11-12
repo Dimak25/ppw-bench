@@ -45,6 +45,20 @@ jobs:
           python ppw_bench.py --duration 8 --no-st --out ci-report.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Instruction-set profiles
+        shell: pwsh
+        run: |
+          chcp 65001 | Out-Null
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          .\bench.exe --caps
+          python ppw_bench.py --isa all --no-st --cooldown 1 --duration 8 --out ci-isa.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-Content ci-isa.txt
+          if (-not (Select-String -Path ci-isa.txt -Pattern "Версия нагрузки\s+: 2" -Quiet)) { throw "no workload version" }
+          $caps = .\bench.exe --caps
+          if ($caps -match "avx2" -and -not (Select-String -Path ci-isa.txt -Pattern "GFLOPS" -Quiet)) { throw "no AVX2 phase" }
+          if ($caps -match "aes" -and -not (Select-String -Path ci-isa.txt -Pattern "GB/s" -Quiet)) { throw "no AES phase" }
+
       - name: Pinned ST + repeats (affinity API)
         shell: pwsh
         run: |
@@ -95,6 +109,12 @@ jobs:
           python ppw_bench.py --only-st --pin 0 --repeat 2 --cooldown 1 --duration 8 --out ci-pin.txt
           grep -E "Ядра +: CPU 0" ci-pin.txt
           grep -E "Частота ядра +: [0-9.]+ ГГц \(CPU 0\)" ci-pin.txt
+          ./bench --caps
+          python ppw_bench.py --isa all --no-st --cooldown 1 --duration 8 --out ci-isa.txt
+          cat ci-isa.txt
+          grep -E "Версия нагрузки +: 2" ci-isa.txt
+          if ./bench --caps | grep -q avx2; then grep -q GFLOPS ci-isa.txt; fi
+          if ./bench --caps | grep -q aes; then grep -q "GB/s" ci-isa.txt; fi
 
       - name: Build tar.gz (no Nuitka)
         run: ./build-linux.sh --no-nuitka
