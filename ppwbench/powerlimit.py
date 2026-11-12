@@ -355,6 +355,56 @@ def read_freq_caps(run=_powercfg, scheme: str = "SCHEME_CURRENT") -> dict[str, t
     return caps
 
 
+# Ограничения ядер в схеме электропитания. Суффикс 1 — класс эффективности 1
+# (на гибридных Intel это P-ядра), без суффикса — класс 0 (E и LP-E, а на
+# обычных CPU — все ядра).
+PLAN_LIMIT_SETTINGS = ("PROCTHROTTLEMAX", "PROCTHROTTLEMAX1", "PROCFREQMAX", "PROCFREQMAX1")
+
+
+def read_plan_settings(names=PLAN_LIMIT_SETTINGS, run=_powercfg,
+                       scheme: str = "SCHEME_CURRENT") -> dict[str, tuple[int, int]]:
+    """{имя: (AC, DC)} для тех параметров, что есть в схеме (остальные пропускаются)."""
+    out = {}
+    for name in names:
+        try:
+            vals = re.findall(r"0x[0-9a-fA-F]{8}", run("/qh", scheme, "SUB_PROCESSOR", name))
+        except (LimitError, OSError, subprocess.SubprocessError):
+            continue
+        if len(vals) >= 2:
+            out[name] = (int(vals[-2], 16), int(vals[-1], 16))
+    return out
+
+
+def plan_limit_warnings(values: dict[str, tuple[int, int]], on_ac: bool,
+                        hybrid: bool) -> list[str]:
+    """Предупреждения, если схема питания урезает ядра для текущего источника питания.
+
+    Например, OEM-утилиты ставят «максимальное состояние» E-ядер 25 % от сети:
+    E- и LP-E-ядра тогда работают на ~1 ГГц, и все их результаты занижены."""
+    idx, src, verb = (0, "от сети", "ac") if on_ac else (1, "от батареи", "dc")
+    groups = [("", "E- и LP-E-ядра" if hybrid else "ядра")]
+    if hybrid:
+        groups.append(("1", "P-ядра"))
+    warns = []
+    for suffix, who in groups:
+        throttle = values.get(f"PROCTHROTTLEMAX{suffix}", (100, 100))[idx]
+        freq = values.get(f"PROCFREQMAX{suffix}", (0, 0))[idx]
+        limits, fixes = [], []
+        if throttle < 100:
+            limits.append(f"максимальное состояние {throttle} %")
+            fixes.append(f"PROCTHROTTLEMAX{suffix} 100")
+        if freq > 0:
+            limits.append(f"максимальная частота {freq} МГц")
+            fixes.append(f"PROCFREQMAX{suffix} 0")
+        if limits:
+            cmd = " && ".join(f"powercfg /set{verb}valueindex SCHEME_CURRENT SUB_PROCESSOR {f}"
+                              for f in fixes)
+            warns.append(f"Схема питания урезает {who} ({src}): {', '.join(limits)} — их "
+                         f"результаты будут занижены. Вернуть: {cmd} && "
+                         "powercfg /setactive SCHEME_CURRENT")
+    return warns
+
+
 def _default_journal() -> Path:
     base = os.environ.get("LOCALAPPDATA") or str(Path.home())
     return Path(base) / "ppw-bench" / "freqcap-restore.json"
