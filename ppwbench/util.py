@@ -112,6 +112,8 @@ def fmt_si(value: float | None, unit: str, digits: int = 3) -> str:
     if value is None:
         return "n/a"
     a = abs(value)
+    if a >= 1e12:
+        return f"{value / 1e12:.{digits}f} T{unit}"
     if a >= 1e9:
         return f"{value / 1e9:.{digits}f} G{unit}"
     if a >= 1e6:

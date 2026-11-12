@@ -27,7 +27,8 @@ def run_menu(monkeypatch, answers, tiers=MTL):
 
 def test_defaults_whole_cpu_60s(monkeypatch):
     res = run_menu(monkeypatch, ["", ""])
-    assert res == {"suite": "cpu", "duration": 60.0, "sweep": None, "limiter": None, "pin": "all",
+    assert res == {"suite": "cpu", "duration": 60.0, "sweep": None, "limiter": None,
+                   "isa": ["scalar"], "pin": "all",
                    "no_st": False, "only_st": False}
 
 
@@ -47,8 +48,8 @@ def test_non_hybrid_uses_auto_pin(monkeypatch):
 
 
 def test_back_and_sensors_then_exit(monkeypatch):
-    # 4 = датчики, Enter = вернуться, 1 -> 0 = назад, 0 = выход
-    assert run_menu(monkeypatch, ["4", "", "1", "0", "0"]) is None
+    # 5 = датчики, Enter = вернуться, 1 -> 0 = назад, 0 = выход
+    assert run_menu(monkeypatch, ["5", "", "1", "0", "0"]) is None
 
 
 @pytest.mark.parametrize("suite,tiers,expected", [
@@ -62,3 +63,28 @@ def test_phase_count(suite, tiers, expected):
 def test_estimate():
     assert cli.estimate_seconds(4, 60, 10) == 4 * 63 + 30
     assert cli.estimate_seconds(1, 20, 10) == 23
+
+
+def test_isa_suite(monkeypatch):
+    it = iter(["4", "1"])
+    monkeypatch.setattr("builtins.input", lambda _p="": next(it))
+    res = cli.interactive_menu(FakeReader(), MTL, cooldown=10,
+                               profiles=["scalar", "avx2", "aes"])
+    assert res["suite"] == "isa" and res["isa"] == ["scalar", "avx2", "aes"]
+    assert res["no_st"] and not res["only_st"]
+    assert cli.suite_phase_count("isa", MTL, 3) == 3
+
+
+def test_resolve_isa():
+    sup = ["scalar", "avx2", "aes"]
+    assert cli.resolve_isa(["all"], sup) == (["scalar", "avx2", "aes"], [])
+    assert cli.resolve_isa(["aes", "scalar"], sup) == (["scalar", "aes"], [])
+    profiles, warns = cli.resolve_isa(["avx2"], ["scalar"])
+    assert profiles == [] and "не поддерживается" in warns[0]
+    assert cli.resolve_isa(["all"], ["scalar"]) == (["scalar"], [])
+
+
+def test_isa_arg():
+    assert cli.isa_arg("AVX2, aes") == ["avx2", "aes"]
+    with pytest.raises(Exception):
+        cli.isa_arg("avx512")

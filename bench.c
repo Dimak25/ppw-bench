@@ -1,14 +1,25 @@
 /*
- * bench.c - deterministic mixed integer/FP CPU workload for PPW measurement.
+ * bench.c - deterministic CPU workloads for PPW measurement.
  *
  * Builds on Windows (Win32 threads, MinGW-w64) and Linux/POSIX (pthreads):
  *   gcc -O2 -static bench.c -o bench.exe            (Windows)
  *   gcc -O2 -static -pthread bench.c -o bench       (Linux)
  *
- * Usage: bench <threads> <seconds> [inner]
+ * Usage: bench <threads> <seconds> [inner] [profile]
+ *        bench --caps                         (profiles this CPU can run)
+ *
+ * Profiles (workload v2):
+ *   scalar  dependent integer chain + FP chains (default; general-purpose code)
+ *   avx2    256-bit FP32 FMA throughput (AVX2 + FMA): 1 unit = 192 FLOP
+ *   aes     AES-128 encryption of 8 parallel blocks (AES-NI): 1 unit = 128 bytes
+ * ISA profiles are compiled with function target attributes and chosen at
+ * run time, so one binary runs everywhere; unsupported ones are refused.
  *
  * Emits on stdout:
  *   BUILD <compiler version>
+ *   WORKLOAD <version>
+ *   PROFILE <name>
+ *   UNIT <name> <per_work_unit>                (only for ISA profiles)
  *   THREADS <n>
  *   START
  *   TICK <elapsed_ms> <total_work_units>      (about once per second, actual time)
@@ -17,7 +28,7 @@
  *   FREQ <thread> <cpu> <mhz>                 (one per thread, see probe)
  *   DONE <elapsed_ms> <total_work_units>
  *
- * 1 work unit = one fixed inner-loop block (INNER), identical for every thread
+ * 1 work unit = one fixed inner-loop iteration, identical for every thread
  * and every machine, so the score is "work units per second".
  */
 #if !defined(_WIN32) && !defined(_GNU_SOURCE)
@@ -26,37 +37,72 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 #include <stdatomic.h>
 
 #ifdef _WIN32
 #include <windows.h>
+#include <malloc.h>
 #else
 #include <pthread.h>
 #include <sched.h>
 #include <time.h>
 #endif
 
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+#define HAVE_X86_ISA 1
+#include <cpuid.h>
+#include <immintrin.h>
+#endif
+
+#define WORKLOAD_VERSION 2
+
 #ifndef DEFAULT_INNER
 #define DEFAULT_INNER 4096
 #endif
 
-/* One slot per worker, padded to its own cache line: a single shared atomic
- * counter makes every core fight over one line, which on many-core CPUs costs
- * both throughput and watts and skews the very thing being measured. */
+/* One slot per worker on its own 64-byte cache line (the allocation is
+ * 64-byte aligned too): a shared line makes cores fight over it, which costs
+ * throughput and watts and skews the very thing being measured. */
 typedef struct {
-    _Atomic unsigned long long work;
+    _Alignas(64) _Atomic unsigned long long work;
     uint64_t sink;
     double probe_mhz; /* measured core clock right after the workload */
     int probe_cpu;    /* logical CPU the probe ran on, -1 if unknown */
-    char pad[64 - sizeof(unsigned long long) - sizeof(uint64_t) - sizeof(double) - sizeof(int)];
 } slot_t;
+
+enum { PROFILE_SCALAR, PROFILE_AVX2, PROFILE_AES };
 
 static slot_t *g_slots = NULL;
 static int g_threads = 1;
 static atomic_int g_stop = 0;
 static int g_inner = DEFAULT_INNER;
 static double g_seconds = 30.0;
+static int g_profile = PROFILE_SCALAR;
 static volatile uint64_t g_sink = 0;
+
+static void *alloc_aligned(size_t size)
+{
+    void *p;
+#ifdef _WIN32
+    p = _aligned_malloc(size, 64);
+#else
+    if (posix_memalign(&p, 64, size) != 0)
+        p = NULL;
+#endif
+    if (p)
+        memset(p, 0, size);
+    return p;
+}
+
+static void free_aligned(void *p)
+{
+#ifdef _WIN32
+    _aligned_free(p);
+#else
+    free(p);
+#endif
+}
 
 /* ---------------------------------------------------------------- timing -- */
 #ifdef _WIN32
@@ -150,20 +196,58 @@ static double probe_mhz(uint64_t one)
 }
 #endif
 
+/* ------------------------------------------------------- CPU capabilities -- */
+
+#ifdef HAVE_X86_ISA
+static int cpu_has_avx2_fma(void)
+{
+    unsigned a, b, c, d;
+    if (!__get_cpuid(1, &a, &b, &c, &d))
+        return 0;
+    int fma = (c >> 12) & 1, osxsave = (c >> 27) & 1, avx = (c >> 28) & 1;
+    if (!(fma && osxsave && avx))
+        return 0;
+    /* the OS must save the YMM state (XCR0 bits 1 and 2) */
+    unsigned xlo, xhi;
+    __asm__ volatile("xgetbv" : "=a"(xlo), "=d"(xhi) : "c"(0));
+    (void)xhi;
+    if ((xlo & 6u) != 6u)
+        return 0;
+    if (__get_cpuid_max(0, NULL) < 7)
+        return 0;
+    __cpuid_count(7, 0, a, b, c, d);
+    return (int)((b >> 5) & 1u);
+}
+
+static int cpu_has_aes(void)
+{
+    unsigned a, b, c, d;
+    if (!__get_cpuid(1, &a, &b, &c, &d))
+        return 0;
+    return (int)((c >> 25) & 1u) && (int)((d >> 26) & 1u); /* AES-NI + SSE2 */
+}
+#else
+static int cpu_has_avx2_fma(void) { return 0; }
+static int cpu_has_aes(void) { return 0; }
+#endif
+
 /* --------------------------------------------------------------- workload -- */
 
-/* Dependent integer chain + independent FP chains: not trivially vectorizable,
- * keeps the core busy with real ALU/FPU work instead of memory traffic. */
-static void worker(intptr_t tid)
+static int should_stop(void) { return atomic_load_explicit(&g_stop, memory_order_relaxed); }
+
+/* Dependent integer chain + FP chains: not trivially vectorizable, keeps the
+ * core busy with real ALU/FPU work instead of memory traffic. Workload v2:
+ * the FP recurrence converges (multiplier < 1) instead of growing to inf
+ * after ~6e9 iterations, as v1 did. */
+static void run_scalar(slot_t *slot, intptr_t tid)
 {
-    slot_t *slot = &g_slots[tid];
     uint64_t x = 0x9E3779B97F4A7C15ULL * (uint64_t)(tid + 1) + 1;
     double a = 1.0 + (double)tid * 0.001;
     double b = 2.0;
     double c = 0.5;
     unsigned long long local = 0;
 
-    while (!atomic_load_explicit(&g_stop, memory_order_relaxed)) {
+    while (!should_stop()) {
         for (int k = 0; k < g_inner; ++k) {
             x = x * 6364136223846793005ULL + 1442695040888963407ULL;
             uint64_t y = x ^ (x >> 29);
@@ -171,19 +255,117 @@ static void worker(intptr_t tid)
             y ^= y >> 32;
             x += y;
 
-            a = a * 1.0000001192092896 + b * 0.9999998807907104;
+            a = a * 0.9999998807907104 + b * 1.1920928955078125e-7;
             b = b - c * 1e-7;
             c = c + 1e-9;
             if ((y & 0xFFFFu) == 0x1234u)
-                a += (double)(y & 0xFFFFFF);
+                a += (double)(y & 0xFFFFFF) * 1e-9;
         }
         local += (unsigned long long)g_inner;
         /* single writer per slot: a relaxed store is enough */
         atomic_store_explicit(&slot->work, local, memory_order_relaxed);
     }
-
     /* keep the compiler from removing the chains (read after join) */
-    slot->sink = (uint64_t)(a + b + c) ^ x ^ local;
+    slot->sink = (uint64_t)(int64_t)(a + b + c) ^ x ^ local;
+}
+
+#ifdef HAVE_X86_ISA
+/* 12 independent 256-bit FMA chains: enough to cover FMA latency (4 cycles)
+ * on two FMA ports. acc = acc * m + c converges to c / (1 - m), so values stay
+ * normal (no denormals, no inf). 1 unit = 12 FMA x 8 lanes x 2 = 192 FLOP. */
+#define AVX2_FLOP_PER_UNIT 192
+__attribute__((target("avx2,fma"))) static void run_avx2(slot_t *slot, intptr_t tid)
+{
+    const __m256 m = _mm256_set1_ps(0.9999f);
+    const __m256 c = _mm256_set1_ps(1e-4f * (float)(tid + 1));
+    __m256 a0 = _mm256_set1_ps(1.00f), a1 = _mm256_set1_ps(1.01f), a2 = _mm256_set1_ps(1.02f);
+    __m256 a3 = _mm256_set1_ps(1.03f), a4 = _mm256_set1_ps(1.04f), a5 = _mm256_set1_ps(1.05f);
+    __m256 a6 = _mm256_set1_ps(1.06f), a7 = _mm256_set1_ps(1.07f), a8 = _mm256_set1_ps(1.08f);
+    __m256 a9 = _mm256_set1_ps(1.09f), a10 = _mm256_set1_ps(1.10f), a11 = _mm256_set1_ps(1.11f);
+    unsigned long long local = 0;
+
+    while (!should_stop()) {
+        for (int k = 0; k < g_inner; ++k) {
+            a0 = _mm256_fmadd_ps(a0, m, c);
+            a1 = _mm256_fmadd_ps(a1, m, c);
+            a2 = _mm256_fmadd_ps(a2, m, c);
+            a3 = _mm256_fmadd_ps(a3, m, c);
+            a4 = _mm256_fmadd_ps(a4, m, c);
+            a5 = _mm256_fmadd_ps(a5, m, c);
+            a6 = _mm256_fmadd_ps(a6, m, c);
+            a7 = _mm256_fmadd_ps(a7, m, c);
+            a8 = _mm256_fmadd_ps(a8, m, c);
+            a9 = _mm256_fmadd_ps(a9, m, c);
+            a10 = _mm256_fmadd_ps(a10, m, c);
+            a11 = _mm256_fmadd_ps(a11, m, c);
+        }
+        local += (unsigned long long)g_inner;
+        atomic_store_explicit(&slot->work, local, memory_order_relaxed);
+    }
+    __m256 s = _mm256_add_ps(_mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3)),
+                             _mm256_add_ps(_mm256_add_ps(a4, a5), _mm256_add_ps(a6, a7)));
+    s = _mm256_add_ps(s, _mm256_add_ps(_mm256_add_ps(a8, a9), _mm256_add_ps(a10, a11)));
+    float out[8];
+    _mm256_storeu_ps(out, s);
+    slot->sink = (uint64_t)(out[0] * 1000.0f) ^ local;
+}
+
+/* AES-128 encryption of 8 independent blocks (like CTR mode): 8 streams
+ * cover the AESENC latency on cores with one or two AES units. The round keys
+ * are fixed constants: the cost of AESENC does not depend on the key, so a
+ * real key schedule would add nothing. 1 unit = 8 blocks x 16 B = 128 bytes,
+ * 80 AES rounds. */
+#define AES_BYTES_PER_UNIT 128
+#define AES_ROUND(k)                                                      \
+    b0 = _mm_aesenc_si128(b0, k); b1 = _mm_aesenc_si128(b1, k);           \
+    b2 = _mm_aesenc_si128(b2, k); b3 = _mm_aesenc_si128(b3, k);           \
+    b4 = _mm_aesenc_si128(b4, k); b5 = _mm_aesenc_si128(b5, k);           \
+    b6 = _mm_aesenc_si128(b6, k); b7 = _mm_aesenc_si128(b7, k);
+__attribute__((target("aes,sse2"))) static void run_aes(slot_t *slot, intptr_t tid)
+{
+    __m128i key[11];
+    for (int r = 0; r < 11; ++r)
+        key[r] = _mm_set_epi32(0x243F6A88 + r, 0x85A308D3 * (r + 1), 0x13198A2E ^ r,
+                               0x03707344 + 7 * r);
+    __m128i b0 = _mm_set_epi32(0, 0, (int)tid, 0), b1 = _mm_set_epi32(0, 0, (int)tid, 1);
+    __m128i b2 = _mm_set_epi32(0, 0, (int)tid, 2), b3 = _mm_set_epi32(0, 0, (int)tid, 3);
+    __m128i b4 = _mm_set_epi32(0, 0, (int)tid, 4), b5 = _mm_set_epi32(0, 0, (int)tid, 5);
+    __m128i b6 = _mm_set_epi32(0, 0, (int)tid, 6), b7 = _mm_set_epi32(0, 0, (int)tid, 7);
+    unsigned long long local = 0;
+
+    while (!should_stop()) {
+        for (int k = 0; k < g_inner; ++k) {
+            b0 = _mm_xor_si128(b0, key[0]); b1 = _mm_xor_si128(b1, key[0]);
+            b2 = _mm_xor_si128(b2, key[0]); b3 = _mm_xor_si128(b3, key[0]);
+            b4 = _mm_xor_si128(b4, key[0]); b5 = _mm_xor_si128(b5, key[0]);
+            b6 = _mm_xor_si128(b6, key[0]); b7 = _mm_xor_si128(b7, key[0]);
+            AES_ROUND(key[1]) AES_ROUND(key[2]) AES_ROUND(key[3])
+            AES_ROUND(key[4]) AES_ROUND(key[5]) AES_ROUND(key[6])
+            AES_ROUND(key[7]) AES_ROUND(key[8]) AES_ROUND(key[9])
+            b0 = _mm_aesenclast_si128(b0, key[10]); b1 = _mm_aesenclast_si128(b1, key[10]);
+            b2 = _mm_aesenclast_si128(b2, key[10]); b3 = _mm_aesenclast_si128(b3, key[10]);
+            b4 = _mm_aesenclast_si128(b4, key[10]); b5 = _mm_aesenclast_si128(b5, key[10]);
+            b6 = _mm_aesenclast_si128(b6, key[10]); b7 = _mm_aesenclast_si128(b7, key[10]);
+        }
+        local += (unsigned long long)g_inner;
+        atomic_store_explicit(&slot->work, local, memory_order_relaxed);
+    }
+    __m128i s = _mm_xor_si128(_mm_xor_si128(_mm_xor_si128(b0, b1), _mm_xor_si128(b2, b3)),
+                              _mm_xor_si128(_mm_xor_si128(b4, b5), _mm_xor_si128(b6, b7)));
+    slot->sink = (uint64_t)_mm_cvtsi128_si32(s) ^ local;
+}
+#endif
+
+static void worker(intptr_t tid)
+{
+    slot_t *slot = &g_slots[tid];
+    switch (g_profile) {
+#ifdef HAVE_X86_ISA
+    case PROFILE_AVX2: run_avx2(slot, tid); break;
+    case PROFILE_AES: run_aes(slot, tid); break;
+#endif
+    default: run_scalar(slot, tid); break;
+    }
 
     slot->probe_cpu = -1;
 #ifdef HAVE_PROBE
@@ -265,15 +447,44 @@ static void thread_join(thread_t t) { pthread_join(t, NULL); }
 
 int main(int argc, char **argv)
 {
+    if (argc > 1 && strcmp(argv[1], "--caps") == 0) {
+        printf("CAPS scalar%s%s\n", cpu_has_avx2_fma() ? " avx2" : "",
+               cpu_has_aes() ? " aes" : "");
+        return 0;
+    }
+
     int threads = 1;
     if (argc > 1) threads = atoi(argv[1]);
     if (threads < 1) threads = 1;
     if (argc > 2) g_seconds = atof(argv[2]);
     if (g_seconds < 1.0) g_seconds = 1.0;
-    if (argc > 3) g_inner = atoi(argv[3]);
+    if (argc > 3 && atoi(argv[3]) > 0) g_inner = atoi(argv[3]); /* 0 = default */
     if (g_inner < 16) g_inner = 16;
 
-    g_slots = (slot_t *)calloc((size_t)threads, sizeof(slot_t));
+    const char *profile = argc > 4 ? argv[4] : "scalar";
+    const char *unit = NULL;
+    int per_unit = 0;
+    if (strcmp(profile, "scalar") == 0) {
+        g_profile = PROFILE_SCALAR;
+    } else if (strcmp(profile, "avx2") == 0 && cpu_has_avx2_fma()) {
+        g_profile = PROFILE_AVX2;
+#ifdef HAVE_X86_ISA
+        unit = "FLOPS";
+        per_unit = AVX2_FLOP_PER_UNIT;
+#endif
+    } else if (strcmp(profile, "aes") == 0 && cpu_has_aes()) {
+        g_profile = PROFILE_AES;
+#ifdef HAVE_X86_ISA
+        unit = "B/s";
+        per_unit = AES_BYTES_PER_UNIT;
+#endif
+    } else {
+        fprintf(stderr, "profile '%s' is not supported on this CPU\n", profile);
+        printf("ERROR unsupported profile %s\n", profile);
+        return 2;
+    }
+
+    g_slots = (slot_t *)alloc_aligned((size_t)threads * sizeof(slot_t));
     thread_t *th = (thread_t *)calloc((size_t)threads, sizeof(thread_t));
     if (!g_slots || !th) {
         fprintf(stderr, "out of memory\n");
@@ -293,6 +504,10 @@ int main(int argc, char **argv)
 #endif
            __VERSION__);
 #endif
+    printf("WORKLOAD %d\n", WORKLOAD_VERSION);
+    printf("PROFILE %s\n", profile);
+    if (unit)
+        printf("UNIT %s %d\n", unit, per_unit);
     printf("THREADS %d\n", threads);
     printf("START\n");
     fflush(stdout);
@@ -326,7 +541,7 @@ int main(int argc, char **argv)
     printf("DONE %.0f %llu\n", e, w);
     fflush(stdout);
     free(th);
-    free(g_slots);
+    free_aligned(g_slots);
     g_sink = sink;
     return started > 0 ? 0 : 1;
 }
